@@ -16,6 +16,7 @@ xssc 在 Linux x86_64 GNU 主机上维护已停止的 systemd 服务，将受签
 - [构建与测试](development.md)
 - [流程与源码导航](project-workflow.md)
 - [计划、签名、阶段和审查参考](reference/README.md)
+- [1.0.1 发布说明](releases/1.0.1.md)
 - [1.0.0 发布说明](releases/1.0.0.md)
 
 xssc 是按需执行的命令行工具。产品的业务结构和当前数据校验由产品本身提供，公共机制来自启用 `offline-maintenance` 的 xcsc 库。代码采用 [Apache License 2.0](../LICENSE-APACHE)。
