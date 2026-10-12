@@ -1534,7 +1534,10 @@ pub fn recover(
                     &backup.resource.path,
                     &backup.entries,
                     backup.resource.path == journal.plan.data_dir,
-                    journal.plan.max_backup_bytes,
+                    // The verified snapshot must fit the backup budget, but
+                    // current data may have grown since runtime handoff. Its
+                    // authorized replacement must not reuse that old budget.
+                    u64::MAX,
                     &backup.ownership,
                 )?;
                 snapshot::restore_ownership(

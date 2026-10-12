@@ -1,6 +1,6 @@
 # xssc 安装、检查与卸载
 
-适用于 `xssc 1.0.0`。当前只发布 **Linux x86_64 GNU** 命令行工具，用于本机 systemd 管理的服务端离线升级；没有 Windows、macOS、Android 或 iOS 执行包。需要 Linux x86_64 主机、GNU 用户空间、systemd，以及支持 Ed25519 的 `/usr/bin/openssl`。六个服务端的升级条件和完整恢复合同见[离线升级与恢复](offline-upgrades.md)。
+适用于 `xssc 1.0.3`。当前只发布 **Linux x86_64 GNU** 命令行工具，用于本机 systemd 管理的服务端离线升级；没有 Windows、macOS、Android 或 iOS 执行包。需要 Linux x86_64 主机、GNU 用户空间、systemd，以及支持 Ed25519 的 `/usr/bin/openssl`。六个服务端的升级条件和完整恢复合同见[离线升级与恢复](offline-upgrades.md)。
 
 xssc 不连接客户端账户，**无需配对或重新配对**；产品签名公钥、独立可信指纹和私有升级计划决定授权范围。公钥轮换应由发布者提供新的可信发行与信任说明，不用客户端实例授权码替代。xssc 也**没有常驻服务、开机启动项或 `service start/stop` 命令**。下文区分工具进程与被维护的服务端服务。
 
@@ -44,25 +44,25 @@ sudo dnf install --assumeyes ca-certificates curl openssl zstd tar coreutils pro
 
 ## 2. 下载、校验与验签
 
-从 [xssc 发布页](https://github.com/isarmg/xssc/releases) 选择 `v1.0.0`，下载实际资产 `xssc-1.0.0-linux-x86_64.tar.zst` 及 `xssc-1.0.0-linux-x86_64.tar.zst.sha256`。当前不单独发布外置 `SHA256SUMS.sig`：**签名、内部文件清单和公钥都在压缩包内**。准备独立可信渠道确认的 xssc 发行公钥 DER SHA-256 指纹，不能把包内 `release.json` 中的指纹当作独立信任来源。
+从 [xssc 发布页](https://github.com/isarmg/xssc/releases) 选择 `v1.0.3`，下载实际资产 `xssc-1.0.3-linux-x86_64.tar.zst` 及 `xssc-1.0.3-linux-x86_64.tar.zst.sha256`。当前不单独发布外置 `SHA256SUMS.sig`：**签名、内部文件清单和公钥都在压缩包内**。准备独立可信渠道确认的 xssc 发行公钥 DER SHA-256 指纹，不能把包内 `release.json` 中的指纹当作独立信任来源。
 
 以下命令在普通用户的独立下载目录执行。先解压和验签，全部通过后才运行包中的程序：
 
 ~~~sh
 # 下载固定版本压缩包；-f 对 HTTP 错误返回失败，-L 跟随 GitHub 资产重定向。
-curl -fL --output xssc-1.0.0-linux-x86_64.tar.zst \
-  https://github.com/isarmg/xssc/releases/download/v1.0.0/xssc-1.0.0-linux-x86_64.tar.zst
+curl -fL --output xssc-1.0.3-linux-x86_64.tar.zst \
+  https://github.com/isarmg/xssc/releases/download/v1.0.3/xssc-1.0.3-linux-x86_64.tar.zst
 # 下载同版归档校验文件。
-curl -fL --output xssc-1.0.0-linux-x86_64.tar.zst.sha256 \
-  https://github.com/isarmg/xssc/releases/download/v1.0.0/xssc-1.0.0-linux-x86_64.tar.zst.sha256
+curl -fL --output xssc-1.0.3-linux-x86_64.tar.zst.sha256 \
+  https://github.com/isarmg/xssc/releases/download/v1.0.3/xssc-1.0.3-linux-x86_64.tar.zst.sha256
 # 校验整个压缩包字节；看到对应文件 OK 后继续。
-sha256sum --check xssc-1.0.0-linux-x86_64.tar.zst.sha256
+sha256sum --check xssc-1.0.3-linux-x86_64.tar.zst.sha256
 # 新建空目录并解压，不接管归档记录的属主，不执行其中程序。
-mkdir xssc-1.0.0
-tar --zstd --extract --file xssc-1.0.0-linux-x86_64.tar.zst \
-  --no-same-owner --directory xssc-1.0.0
+mkdir xssc-1.0.3
+tar --zstd --extract --file xssc-1.0.3-linux-x86_64.tar.zst \
+  --no-same-owner --directory xssc-1.0.3
 # 进入包根；bin/、docs/、SHA256SUMS 和 SHA256SUMS.sig 均在此目录内。
-cd xssc-1.0.0
+cd xssc-1.0.3
 # 替换为独立可信渠道确认的 64 位小写十六进制指纹，不能照抄包内元数据。
 XSSC_EXPECTED_KEY_SHA256='替换为独立确认的发行公钥DER指纹'
 # 计算包内公钥的 DER SHA-256；此值只用于与独立指纹比较。
@@ -85,11 +85,11 @@ sha256sum --check SHA256SUMS
 
 ~~~sh
 # 确认版本目录尚不存在，防止把不同输入混入旧安装。
-test ! -e /opt/sarmg/xssc/1.0.0
+test ! -e /opt/sarmg/xssc/1.0.3
 # 创建 root 拥有、普通用户不可写的程序版本目录。
-sudo install -d -o root -g root -m 0755 /opt/sarmg/xssc/1.0.0
+sudo install -d -o root -g root -m 0755 /opt/sarmg/xssc/1.0.3
 # 复制已验证的完整包：保留文档、签名、清单和发行身份，目标由 root 创建。
-sudo cp -R . /opt/sarmg/xssc/1.0.0/
+sudo cp -R . /opt/sarmg/xssc/1.0.3/
 # 将已验证二进制安装到 PATH 的常见目录，固定 root 所有及 0755 模式。
 sudo install -o root -g root -m 0755 bin/xssc /usr/local/bin/xssc
 # 先使用绝对路径确认实际安装版本。
@@ -104,7 +104,7 @@ sudo install -o root -g root -m 0755 bin/xssc /usr/local/bin/xssc
 command -v xssc
 ~~~
 
-版本必须为 `xssc 1.0.0`，`support --json` 的 `compiled_target` 和 `formal_release_target` 应为 `x86_64-unknown-linux-gnu`，`source_revision` 应与此发行版本的正式源码提交一致。核对包内 `release.json` 和 `adapter-catalog.json`，保留完整安装包作为验收依据。若 `command -v` 未指向 `/usr/local/bin/xssc`，后续使用绝对路径；sudo 的 PATH 也可能与当前终端不同。
+版本必须为 `xssc 1.0.3`，`support --json` 的 `compiled_target` 和 `formal_release_target` 应为 `x86_64-unknown-linux-gnu`，`source_revision` 应与此发行版本的正式源码提交一致。核对包内 `release.json` 和 `adapter-catalog.json`，保留完整安装包作为验收依据。若 `command -v` 未指向 `/usr/local/bin/xssc`，后续使用绝对路径；sudo 的 PATH 也可能与当前终端不同。
 
 ## 4. 配置与执行升级
 
@@ -167,7 +167,7 @@ pgrep -a -x xssc
 # 删除本指南安装的固定程序，不操作任何 Server unit。
 sudo rm -- /usr/local/bin/xssc
 # 删除本指南保存的这个版本完整包；不会删除 /opt/sarmg 下其他产品或版本。
-sudo rm -r -- /opt/sarmg/xssc/1.0.0
+sudo rm -r -- /opt/sarmg/xssc/1.0.3
 # 验收固定程序已不存在，再检查 PATH 是否还有其他 xssc 安装。
 test ! -e /usr/local/bin/xssc
 command -v xssc

@@ -1176,6 +1176,86 @@ fn recovery_start_interruption_also_protects_writes_before_a_second_restore() {
     );
 }
 
+fn recover_after_runtime_growth_beyond_backup_budget(kind: ResourceType) {
+    let mut fixture = Fixture::new();
+    fixture.plan.max_backup_bytes =
+        fs::metadata(&fixture.plan.installed_binary).unwrap().len() + 1024;
+    let current = match kind {
+        ResourceType::Directory => fixture.plan.data_dir.join("business.txt"),
+        ResourceType::File => {
+            let external = fixture._directory.path().join("external-state");
+            fs::write(&external, b"original external state").unwrap();
+            fixture.plan.resources.push(PersistentResource {
+                name: "external".into(),
+                path: external.clone(),
+                kind,
+            });
+            fixture.release.resources.push(ReleaseResource {
+                name: "external".into(),
+                kind,
+            });
+            fixture.sign();
+            external
+        }
+    };
+    let original = fs::read(&current).unwrap();
+    let mut control = fixture.control();
+    let journal = apply(&fixture.plan, &mut control).unwrap();
+    assert_eq!(journal.phase, UpgradePhase::Ready);
+    let growth = vec![b'x'; fixture.plan.max_backup_bytes as usize + 1];
+    fs::write(&current, &growth).unwrap();
+    control.active = false;
+    assert_eq!(
+        recover(&fixture.plan.work_directory, false, &mut control)
+            .unwrap_err()
+            .code,
+        "RECOVERY_AUTHORIZATION_REQUIRED"
+    );
+    assert_eq!(fs::read(&current).unwrap(), growth);
+    let inspection = inspect_status(&fixture.plan.work_directory).unwrap();
+    assert!(inspection.journal.backup_complete);
+    assert_eq!(
+        inspection.persistent_state_verification,
+        "changed-or-unreadable"
+    );
+    let restored = recover(&fixture.plan.work_directory, true, &mut control).unwrap();
+    assert_eq!(restored.phase, UpgradePhase::RolledBack);
+    assert_eq!(fs::read(&current).unwrap(), original);
+    assert_eq!(
+        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
+        journal.original_binary_sha256
+    );
+    assert!(!fixture.plan.data_dir.join(PENDING).exists());
+    assert!(control.active);
+}
+
+#[test]
+fn authorized_recovery_allows_directory_growth_beyond_backup_budget() {
+    recover_after_runtime_growth_beyond_backup_budget(ResourceType::Directory);
+}
+
+#[test]
+fn authorized_recovery_allows_file_growth_beyond_backup_budget() {
+    recover_after_runtime_growth_beyond_backup_budget(ResourceType::File);
+}
+
+#[test]
+fn original_state_must_still_fit_the_complete_backup_budget() {
+    let mut fixture = Fixture::new();
+    fixture.plan.max_backup_bytes =
+        fs::metadata(&fixture.plan.installed_binary).unwrap().len() + 1024;
+    let oversized = vec![b'x'; fixture.plan.max_backup_bytes as usize + 1];
+    let current = fixture.plan.data_dir.join("business.txt");
+    fs::write(&current, &oversized).unwrap();
+    let mut control = fixture.control();
+    assert!(apply(&fixture.plan, &mut control).is_err());
+    let journal = inspect(&fixture.plan.work_directory).unwrap();
+    assert_eq!(journal.phase, UpgradePhase::BackupStarted);
+    assert!(!journal.backup_complete);
+    assert_eq!(control.validate_calls, 0);
+    assert_eq!(fs::read(current).unwrap(), oversized);
+}
+
 #[test]
 fn concurrent_instance_lock_prevents_backup_and_unknown_links_are_rejected() {
     let fixture = Fixture::new();
