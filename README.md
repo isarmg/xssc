@@ -14,14 +14,14 @@ xssc 是服务端离线升级命令行工具，用于验证受签名发行物、
 
 ## 快速部署
 
-下载 [v1.0.0 发行包及校验文件](https://github.com/isarmg/xssc/releases/tag/v1.0.0)，在独立空目录中执行：
+下载 [v1.0.3 发行包及校验文件](https://github.com/isarmg/xssc/releases/tag/v1.0.3)，在独立空目录中执行：
 
 ```sh
 set -eu
-sha256sum --check xssc-1.0.0-linux-x86_64.tar.zst.sha256
-mkdir xssc-1.0.0
-tar --zstd -xf xssc-1.0.0-linux-x86_64.tar.zst --no-same-owner -C xssc-1.0.0
-cd xssc-1.0.0
+sha256sum --check xssc-1.0.3-linux-x86_64.tar.zst.sha256
+mkdir xssc-1.0.3
+tar --zstd -xf xssc-1.0.3-linux-x86_64.tar.zst --no-same-owner -C xssc-1.0.3
+cd xssc-1.0.3
 # 必须从独立可信渠道取得指纹，不使用包内自报值。
 EXPECTED_KEY_SHA256='替换为可信发行公钥的64位小写DER-SHA256指纹'
 ACTUAL_KEY_SHA256=$(/usr/bin/openssl pkey -pubin -in RELEASE-SIGNING-PUBLIC.pem -outform DER | sha256sum | cut -d ' ' -f 1)
