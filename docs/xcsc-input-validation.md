@@ -1,6 +1,6 @@
 # xcsc 输入校验
 
-xssc 作为客户端工具只消费一个 `xcsc` Cargo 包，启用 `offline-maintenance` 特性，固定官方 URL `https://github.com/isarmg/xcsc`、精确版本 `=1.0.1` 和完整提交修订 `d3e9b8db84e4ead70ec0bf8a596dbad697f7db24`。`xcsc::contracts`、`xcsc::state_file`、`xcsc::fs_safety`、`xcsc::log` 和 `xcsc::sqlite` 是包内模块。Cargo 正常、build、dev 与锁文件输入对应同一个正式客户端公共包。
+xssc 作为客户端工具只消费一个 `xcsc` Cargo 包，启用 `offline-maintenance` 特性，固定官方 URL `https://github.com/isarmg/xcsc`、精确版本 `=1.0.3` 和完整提交修订 `5641a33e991209eecdbbc91cffaa3be545875757`。`xcsc::contracts`、`xcsc::state_file`、`xcsc::fs_safety`、`xcsc::log` 和 `xcsc::sqlite` 是包内模块。Cargo 正常、build、dev 与锁文件输入对应同一个正式客户端公共包。
 
 `xcsc-client.toml`、`Cargo.toml` 与根 `Cargo.lock` 必须表达同一来源和客户端角色。`offline-maintenance` 仅为 Linux 离线管理提供状态锁、文件安全、日志和有界 SQLite 支持；工具拥有升级编排、签名策略、快照和恢复状态机。离线维护遵循被维护产品给出的真实持久状态合同。
 

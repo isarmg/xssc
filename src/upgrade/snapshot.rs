@@ -490,6 +490,9 @@ pub(super) fn restore(
                 &path,
                 &[Entry {
                     path: PathBuf::new(),
+                    // Keep directories writable until their children have
+                    // been restored; the reverse pass below seals them.
+                    mode: if entry.directory { 0o700 } else { entry.mode },
                     ..entry.clone()
                 }],
                 &[Ownership {

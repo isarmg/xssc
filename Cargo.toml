@@ -1,6 +1,6 @@
 [package]
 name = "xssc"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.99"
 authors = ["sarmg <isarmg@163.com>"]
@@ -12,7 +12,7 @@ publish = false
 libc = "0.2"
 anyhow = "1"
 clap = { version = "4.6.7", features = ["derive"] }
-xcsc = { git = "https://github.com/isarmg/xcsc.git", rev = "d3e9b8db84e4ead70ec0bf8a596dbad697f7db24", version = "=1.0.1", features = ["offline-maintenance"] }
+xcsc = { git = "https://github.com/isarmg/xcsc.git", rev = "5641a33e991209eecdbbc91cffaa3be545875757", version = "=1.0.3", features = ["offline-maintenance"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustix = { version = "1.1", features = ["fs", "process", "time"] }

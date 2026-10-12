@@ -71,7 +71,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: isarmg/xcsc
-          ref: d3e9b8db84e4ead70ec0bf8a596dbad697f7db24
+          ref: 5641a33e991209eecdbbc91cffaa3be545875757
           path: xcsc-policy
           persist-credentials: false
       - name: Verify manifest, immutable dependencies and exact lock source

@@ -47,6 +47,85 @@ fn state_lock_verification_failure_unlocks_only_the_original_description() {
     drop(alias);
 }
 
+#[test]
+fn restore_read_only_directories_preserves_contents_modes_and_ownership() {
+    // A root process would hide the permission regression. Exercise the same
+    // test as an ordinary user even when the suite is launched by root.
+    if rustix::process::geteuid().as_raw() == 0 {
+        use std::os::unix::process::CommandExt;
+        let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = temporary.path().join("nonroot-restore-test");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "upgrade::tests::restore_read_only_directories_preserves_contents_modes_and_ownership",
+                "--nocapture",
+            ])
+            .uid(65534)
+            .gid(65534)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "non-root restore failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for mode in [0o500, 0o555] {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let backup = temporary.path().join("backup");
+        let target = temporary.path().join("target");
+        for root in [&original, &target] {
+            snapshot::private_directory(root).unwrap();
+            snapshot::private_directory(&root.join("nested")).unwrap();
+            snapshot::private_directory(&root.join("nested/deeper")).unwrap();
+            fs::write(root.join("nested/object"), b"original object").unwrap();
+            fs::write(root.join("nested/deeper/object"), b"nested object").unwrap();
+            for relative in ["nested/deeper", "nested"] {
+                fs::set_permissions(root.join(relative), fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        let entries = snapshot::inventory(&original, true, 4096, true).unwrap();
+        let owners = snapshot::ownership(&original, &entries).unwrap();
+        snapshot::snapshot(&original, &backup, &entries).unwrap();
+        let gate = target.join(snapshot::PENDING);
+        fs::write(&gate, b"pending gate").unwrap();
+        let gate_inode = fs::metadata(&gate).unwrap().ino();
+        let result = (|| -> anyhow::Result<()> {
+            // Include an extra entry to verify replacement and repeat recovery
+            // from an already restored read-only directory tree.
+            for _ in 0..2 {
+                fs::write(target.join("obsolete"), b"remove during restore")?;
+                snapshot::restore(&backup, &target, &entries, true, 4096, &owners)?;
+                assert_eq!(snapshot::inventory(&target, true, 4096, true)?, entries);
+                assert_eq!(snapshot::ownership(&target, &entries)?, owners);
+                assert_eq!(fs::read(target.join("nested/object"))?, b"original object");
+                assert_eq!(
+                    fs::read(target.join("nested/deeper/object"))?,
+                    b"nested object"
+                );
+                assert_eq!(fs::metadata(&gate)?.ino(), gate_inode);
+                assert_eq!(fs::read(&gate)?, b"pending gate");
+                assert!(!target.join("obsolete").exists());
+            }
+            Ok(())
+        })();
+        // Allow TempDir to remove the fixture even if restoration failed.
+        for root in [&original, &backup, &target] {
+            for relative in ["", "nested", "nested/deeper"] {
+                let _ = fs::set_permissions(root.join(relative), fs::Permissions::from_mode(0o700));
+            }
+        }
+        result.unwrap();
+    }
+}
+
 struct Fixture {
     _directory: tempfile::TempDir,
     plan: UpgradePlan,

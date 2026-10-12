@@ -75,6 +75,6 @@ python3 scripts/stage-upgrade-release.py \
 
 原完整发行根目录和全部持久资源属于同一个已完成备份组。恢复保留原发行根目录；若原 inode 仍在但资产损坏，先持久化修复意图，将损坏树移到 `.upgrade-displaced-original-操作ID` 留证，重建原树并切回选择链接。发生在移开原发行根目录后的中断，可凭固定原 inode/持久意图/完整备份继续；未知替换 inode、悬空 link 和损坏备份均拒绝覆盖。未完成发布的暂存树保留，不猜测删除。
 
-对于 root 管理程序目录、独立服务 UID 持有数据的部署，工具采用 xcsc 1.0.1 的客户端离线维护与文件保护入口；被维护产品仍实施既定运行属主与权限规则。行政入口仅允许实际属主或 root，数据目录必须物理 0700，root 创建的维护锁/门继承目录实际 UID/GID 和 0600。主 systemd 固定 User/Group 必须与数据目录属主一致，DynamicUser 暂不支持。产品 config JSON 也必须供实际服务 UID 读取；工具不把管理员环境或仅 root 可读的 EnvironmentFile 内容偷偷注入验证进程。
+对于 root 管理程序目录、独立服务 UID 持有数据的部署，工具采用 xcsc 1.0.3 的客户端离线维护与文件保护入口；被维护产品仍实施既定运行属主与权限规则。行政入口仅允许实际属主或 root，数据目录必须物理 0700，root 创建的维护锁/门继承目录实际 UID/GID 和 0600。主 systemd 固定 User/Group 必须与数据目录属主一致，DynamicUser 暂不支持。产品 config JSON 也必须供实际服务 UID 读取；工具不把管理员环境或仅 root 可读的 EnvironmentFile 内容偷偷注入验证进程。
 
 事务日志和私密备份保持操作者 0700。为独立服务 UID 执行只读验证，公开发行闭包封存在安装父目录下 root 持有的 `.xssc-execution-操作ID`；它及祖先可遍历但不能由服务 UID、组或其他用户修改。工具先 NOFOLLOW 打开固定 ELF FD，再继承 FD4执行；清辅助组、切实际 GID/UID，并清环境。父进程保留排他维护锁，子进程只校验当前状态；没有迁移授权通道。持久资源另外记录逐项 UID/GID，恢复保留原属主、权限和内容；协议锁/门保持原 inode。辅助命令 stdout/stderr 同时非阻塞读取，各自最多 1MiB，超限/超时 kill+wait，stderr不进入普通错误说明。
