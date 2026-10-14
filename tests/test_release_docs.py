@@ -5,10 +5,12 @@ import importlib.util
 from pathlib import Path
 import tarfile
 import tempfile
+import tomllib
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CURRENT_VERSION = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
 spec = importlib.util.spec_from_file_location("stage_release_docs", ROOT / "scripts/stage-release-docs.py")
 documents = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(documents)
@@ -43,7 +45,7 @@ class ReleaseDocumentsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary) / "package"
             package.mkdir()
-            files = documents.stage(ROOT, package, "1.0.0")
+            files = documents.stage(ROOT, package, CURRENT_VERSION)
             required = set(documents.DOCUMENTS) | {
                 "README.md", "OFFLINE-UPGRADES.md", "docs/platform-setup.md",
                 "docs/development-contract.md", "docs/common-support.md",
@@ -54,7 +56,7 @@ class ReleaseDocumentsTests(unittest.TestCase):
             self.assertIn("xssc --version", (package / "docs/platform-setup.md").read_text())
             self.assertIn("docs/operations.md", (package / "README.md").read_text())
             self.assertIn("docs/offline-upgrades.md", (package / "OFFLINE-UPGRADES.md").read_text())
-            documents.verify(package, "1.0.0")
+            documents.verify(package, CURRENT_VERSION)
             archive = Path(temporary) / "release.tar"
             with tarfile.open(archive, "w") as output:
                 for name in sorted(files):
@@ -63,10 +65,10 @@ class ReleaseDocumentsTests(unittest.TestCase):
             extracted.mkdir()
             with tarfile.open(archive) as packaged:
                 packaged.extractall(extracted, filter="data")
-            self.assertEqual(documents.verify(extracted, "1.0.0"), files)
+            self.assertEqual(documents.verify(extracted, CURRENT_VERSION), files)
             (extracted / "docs/platform-setup.md").unlink()
             with self.assertRaises(ValueError):
-                documents.verify(extracted, "1.0.0")
+                documents.verify(extracted, CURRENT_VERSION)
 
     def test_nested_documents_references_assets_anchors_and_cycles_are_closed(self):
         with tempfile.TemporaryDirectory() as temporary:

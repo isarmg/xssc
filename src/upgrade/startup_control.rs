@@ -186,7 +186,7 @@ impl Manager for Systemd {
             "org.freedesktop.systemd1".into(),
             "/org/freedesktop/systemd1".into(),
             "org.freedesktop.systemd1.Manager".into(),
-            "GetUnit".into(),
+            "LoadUnit".into(),
             "s".into(),
             service.into(),
         ])?;
@@ -906,6 +906,70 @@ pub(super) fn collection_ready(journal: &UpgradeJournal) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an explicitly prepared isolated inactive host-systemd fixture"]
+    fn inactive_host_unit_uses_metadata_reload_and_complete_startup_guard() {
+        let operation = std::env::var("XSSC_INACTIVE_UNIT_FIXTURE")
+            .expect("set the explicitly owned inactive fixture UUID");
+        let operation: uuid::Uuid = operation.parse().expect("fixture UUID");
+        assert_eq!(operation.get_version_num(), 4);
+        let name = format!("xssc-startup-probe-{operation}");
+        let service = format!("{name}.service");
+        let root = PathBuf::from(format!("/run/{name}"));
+        let permit = root.join("permit");
+        let unit = PathBuf::from("/run/systemd/system").join(&service);
+        let condition = unit
+            .with_file_name(format!("{service}.d"))
+            .join("90-xssc-probe.conf");
+        assert_eq!(rustix::process::geteuid().as_raw(), 0);
+        assert!(!permit.exists());
+        let authority = |path: &Path| {
+            let info = fs::symlink_metadata(path).unwrap();
+            assert_eq!(info.uid(), 0);
+            assert_eq!(info.mode() & 0o7022, 0);
+            assert!(info.is_file() && info.nlink() == 1);
+            (info.dev(), info.ino(), info.mode(), fs::read(path).unwrap())
+        };
+        let files_before = [authority(&unit), authority(&condition)];
+        let mut manager = Systemd { timeout: 10 };
+        let before = manager.inspect(&service, None).unwrap();
+        assert!(before.stopped());
+        assert_eq!(before.active_state, "inactive");
+        assert_eq!(before.unit_file_state, "disabled");
+        manager
+            .observes(&service, &condition, &permit, true)
+            .unwrap();
+        assert!(
+            manager
+                .observes(&service, &condition, &root.join("different-permit"), true)
+                .is_err()
+        );
+        assert!(
+            manager
+                .observes(
+                    &service,
+                    &condition.with_file_name("different.conf"),
+                    &permit,
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .observes(&service, &condition, &permit, false)
+                .is_err()
+        );
+        let mut after = manager.inspect(&service, None).unwrap();
+        after.observed_at_micros = before.observed_at_micros;
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!([authority(&unit), authority(&condition)], files_before);
+        assert!(!permit.exists());
+    }
+
     #[derive(Default)]
     struct ObservedManager {
         reloads: usize,
