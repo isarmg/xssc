@@ -97,6 +97,25 @@ jobs:
       - name: Enforce workflow supply-chain policy
         run: ./scripts/check-workflow-supply-chain.py
 
+      - name: Read immutable independent build tool source
+        id: build_tools
+        run: |
+          python3 - <<'PY'
+          import json,os,re
+          value=json.load(open('build-tools-source.json'))
+          if value['repository']!='https://github.com/isarmg/xssi.git' or not isinstance(value['revision'],str) or not re.fullmatch('[0-9a-f]{40}',value['revision']):
+              raise SystemExit('Pin the reviewed build tool source before validation')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:output.write('revision='+value['revision']+'\n')
+          PY
+
+      - name: Check out exact independent publisher test dependencies
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: isarmg/xssi
+          ref: ${{ steps.build_tools.outputs.revision }}
+          path: .release-build-tools
+          persist-credentials: false
+
       - name: Test release identity checks
         run: python3 tests/test_finalize_release.py
 

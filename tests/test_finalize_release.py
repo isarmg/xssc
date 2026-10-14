@@ -16,7 +16,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = "a" * 40
 VERSION = "1.2.3"
-TOOLS = ROOT.parent / "xssi"
+TOOLS = Path(os.environ.get("XSSI_BUILD_TOOLS_DIR", ROOT / ".release-build-tools")).resolve(strict=True)
+tool_pin = json.loads((ROOT / "build-tools-source.json").read_text())
+if tool_pin["repository"] != "https://github.com/isarmg/xssi.git":
+    raise ValueError("publisher tests require the declared official build tool source")
+if subprocess.check_output(["git", "-C", str(TOOLS), "rev-parse", "HEAD"], text=True).strip() != tool_pin["revision"]:
+    raise ValueError("publisher tests require the exact pinned build tool revision")
+if subprocess.check_output(["git", "-C", str(TOOLS), "status", "--porcelain", "--untracked-files=all"]):
+    raise ValueError("publisher tests require a clean build tool checkout")
 sys.path.insert(0,str(TOOLS/"scripts"))
 import release_sbom
 
