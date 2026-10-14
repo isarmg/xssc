@@ -1,30 +1,21 @@
-# 操作、演练与发行
+# 操作与恢复
 
-现场维护按以下顺序进行：
+日常操作：`sudo ROOT/upgrade.sh --root ROOT --version N.N.N`。XSSI 持有 ROOT 工具锁，在停服之前下载、核验SHA256并核对完整目标包、服务账号和实际加载的 systemd 单元。XSSC 先封存校验目标，持久记录工作目录、writer 原状态及本操作启动条件的 inode，验证系统管理器已加载限制后停止全部 writer；XCOS 包含 MediaMTX。
 
-1. [验证并安装工具](platform-setup.md)
-2. [准备计划](configuration.md)，核对目标签名、当前发行身份和资源范围
-3. 停止主服务及全部写入进程，按[升级步骤](offline-upgrades.md#执行升级)执行
-4. 保存结果和恢复目录；出现问题先[检查事务](troubleshooting.md)
+停止证明完成后，源辅助程序报告精确保护范围，XSSC 备份完整程序及状态组。源和目标独立辅助程序只读检查各自发行绑定的当前结构，校验器修改文件、ACL、权限或修改时间都会拒绝。只有当前结构一致时才切换清单载荷，持久保存可能出现新写入的 intent，移除自身启动限制，启动依赖与主服务，验收实际 ELF 摘要、服务身份和业务就绪。
 
-`support --json` 与 `catalog --json` 可随时查看构建能力和产品目录。成功切换已由工具启动并验证产品；日常服务管理继续按产品安装方式进行。
+```sh
+sudo xssc --json inspect-upgrade --work-directory /absolute/ROOT/maintenance/upgrades/UUID
+sudo xssc --json recover-upgrade --work-directory /absolute/ROOT/maintenance/upgrades/UUID
+```
 
-## 恢复
+恢复首先核对原事务的目录与载荷 inode、备份和实际程序，重新建立本操作启动限制后停止 writer。只有明确愿意丢弃备份之后的业务写入，才增加 `--allow-data-loss`；未知程序、损坏备份、结构不符或未知 writer 不会被强制覆盖。失败保留启动控制与完整恢复材料；纯预检没有服务副作用的记录可清理已授权暂存并关闭。
 
-恢复根据已保存的计划、完整快照和实际安装身份执行。按[恢复步骤](offline-upgrades.md#失败恢复与数据损失授权)先检查再操作。交接运行权后默认保全新写入；`--allow-data-loss` 会授权丢弃备份之后的业务写入，使用前明确确认这一损失范围。
+```sh
+sudo xssc --json collect-upgrades --root /absolute/ROOT --minimum-age-seconds 2592000 --keep-completed 2
+sudo xssc --json collect-upgrades --root /absolute/ROOT --minimum-age-seconds 2592000 --keep-completed 2 --execute
+```
 
-## 演练
+保留策略必须显式提供，默认输出具体回收计划。只有已完成、过期、超过保留数量、没有其他记录引用并且启动控制已释放的事务才可回收。执行前持久保存对象 inode 与属性清单；被替换、未知、仍承担恢复义务的资源保留。回收中断后给同一策略和 `--execute --resume-collection UUID`，只继续原记录授权的剩余对象。
 
-在独立临时实例验证正常切换、启动失败、中断恢复及交接后的新写入保护。[构建与测试](development.md)列出机制检查和真实产品演练命令。演练结果记录实际源码、产品、平台及系统服务管理器是否为测试替身。
-
-## 发行
-
-`stage-release.sh` 从干净、带对应附注标签的源码构建 Linux AMD64 GNU 程序，绑定完整 HEAD，并封装能力 JSON、文档和公钥。`finalize-release.sh` 在读取私钥前核对实际二进制能力、版本、源码、目标平台和制品摘要，再签名、解包并自验证。
-
-离线包保留 `docs/` 相对结构；`stage-release-docs.py` 递归收集操作指南的引用。签名前和解包后验证本地文件及锚点，所有封装文档参与 `SHA256SUMS` 和签名。发布时运行[发行检查](development.md#运行检查)，并保留最终源码、CI 与回下载验证结果。
-
-目标产品的受签名升级制品按[制作参考](reference/release-artifacts.md)准备。公共依赖来源见[公共支撑](common-support.md)，设计职责见[开发约束](development-contract.md)。
-
-## 历史记录
-
-预基线的独立备份适配器因配置路径和结构合同不匹配而删除。当前完整快照和恢复属于统一升级事务。历史验收保留在[验证台账](validation.md)，对应版本与当前源码分别记录。
+[合同](offline-upgrades.md) · [部署](platform-setup.md)

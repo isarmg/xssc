@@ -1,21 +1,7 @@
-# 事务阶段参考
+# 持久事务阶段
 
-| 持久阶段 | 已证明的完成条件 |
-|---|---|
-| `prechecked` | 已确认服务停止、验证签名目标并封存，计划与原二进制身份已记录 |
-| `maintenance-intent` | 维护意图已记录，维护门保护后续正常启动 |
-| `maintenance-acquired` | 所有声明的 unit 仍停止，持有数据目录独占维护权 |
-| `backup-started` | 正在备份；部分备份不可用于恢复 |
-| `backup-complete` | 旧程序、配置和数据整组清单/摘要已验证 |
-| `validated` | 源/目标结构与资源范围验证通过，最终只读验证未发生意外写入 |
-| `switch-intent` | 切换意图已持久化；检查实际程序 SHA 判断是否已完成原子替换 |
-| `switched` | 目标二进制实际摘要通过 |
-| `start-intent` | 交接已持久化；无论后续命令/观察结果如何，均视为可能产生新写入 |
-| `ready` | 指定目标进程与产品业务就绪均已验证 |
-| `recovery-maintenance-intent` / `recovery-restoring` | 确认所有写入进程已停，设置维护门并持有独占权后，正在恢复原整组状态；允许在门保护下续接 |
-| `recovery-start-intent` | 原程序取得运行权，亦可能产生恢复后的新写入 |
-| `rolled-back` | 原程序、配置和数据对应，原程序业务就绪通过；或未变更的预检查记录已关闭 |
+正常流程：prechecked → maintenance-intent → maintenance-acquired → backup-started → backup-complete → validated → switch-intent → switched → start-intent → ready。
 
-每次记录写入先同步私有事务日志，再进入下一阶段。门和目录均同步。`inspect-upgrade` 重新校验已完成备份，并报告实际已安装程序属于原版、目标版、未知或不可读，维护门是否存在，以及当前状态是否仍与备份相符；未能读取或验证不等于未修改。
+恢复流程：recovery-maintenance-intent → recovery-restoring → recovery-start-intent → rolled-back。
 
-发生中断时按[恢复步骤](../offline-upgrades.md#失败恢复与数据损失授权)操作。
+可能发生写入的标志在移除本操作系统管理器启动条件和启动服务之前持久化。部分备份不能当作完整快照使用。启动控制和程序切换的 intent 必须在副作用前落盘；未完成阶段不被猜测为成功。检查命令只读输出事务、当前程序身份、启动控制与备份验证结果。[恢复](../operations.md)

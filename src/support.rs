@@ -18,11 +18,11 @@ pub struct SupportMatrix {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProductSupport {
     pub product: Product,
-    pub signed_release_upgrade: bool,
+    pub release_upgrade: bool,
     pub durable_recovery: bool,
 }
 
-/// Products provide ordinary current-state diagnostics; signed deployment
+/// Products provide ordinary current-state diagnostics; verified deployment
 /// authority belongs to this tool's controlled definitions.
 /// No software version is inferred from a persistent format label.
 pub fn support_matrix() -> SupportMatrix {
@@ -31,11 +31,12 @@ pub fn support_matrix() -> SupportMatrix {
         source_revision: env!("XSSC_COMPILED_SOURCE_REVISION"),
         compiled_target: env!("XSSC_COMPILED_TARGET"),
         formal_release_target: FORMAL_RELEASE_TARGET,
-        release_upgrade_protocol: "signed-product-state-systemd-v1",
-        state_transition: "current-to-future-same-contract",
+        release_upgrade_protocol: "fixed-root-payload-v1",
+        state_transition: "current-structure-readonly-check",
         supported_capabilities: vec![
-            "signed-same-schema-release-upgrade",
-            "complete-immutable-release-root",
+            "checksum-same-schema-release-upgrade",
+            "current-structure-readonly-check",
+            "checksum-fixed-root-file-inventory",
             "complete-program-configuration-state-backup",
             "durable-release-upgrade-recovery",
             "explicit-post-start-data-loss-authorization",
@@ -47,7 +48,7 @@ pub fn support_matrix() -> SupportMatrix {
                 let runtime = product.contract().has_runtime_state;
                 ProductSupport {
                     product,
-                    signed_release_upgrade: runtime,
+                    release_upgrade: runtime,
                     durable_recovery: runtime,
                 }
             })
@@ -70,15 +71,14 @@ mod tests {
                 .filter(|entry| entry.product == product)
                 .collect::<Vec<_>>();
             assert_eq!(matching.len(), 1);
-            assert!(matching[0].signed_release_upgrade);
+            assert!(matching[0].release_upgrade);
             assert!(matching[0].durable_recovery);
         }
-        assert_eq!(matrix.state_transition, "current-to-future-same-contract");
+        assert_eq!(matrix.state_transition, "current-structure-readonly-check");
         assert!(
             matrix
                 .supported_capabilities
-                .iter()
-                .all(|entry| !entry.contains("migration"))
+                .contains(&"current-structure-readonly-check")
         );
     }
 }

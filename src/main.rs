@@ -10,6 +10,10 @@ use xssc::{Product, support_matrix};
     about = "Verify current releases offline, apply upgrades, and recover the complete program, configuration and persistent data group."
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    tool_lock_fd: Option<i32>,
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -17,7 +21,7 @@ struct Cli {
 /// Upgrade current managed releases and recover the complete protected group.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Upgrade a signed release after the operator has stopped every state writer.
+    /// Upgrade a verified release under durable startup control after verifying all verified inputs.
     ApplyUpgrade {
         #[arg(long)]
         plan: PathBuf,
@@ -35,16 +39,23 @@ enum Command {
         #[arg(long)]
         allow_data_loss: bool,
     },
+    /// Plan or explicitly collect closed upgrade materials under an authorized retention policy.
+    CollectUpgrades {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        minimum_age_seconds: u64,
+        #[arg(long)]
+        keep_completed: usize,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        resume_collection: Option<uuid::Uuid>,
+    },
     /// Show the currently supported products and their upgrade and recovery capabilities.
-    Support {
-        #[arg(long)]
-        json: bool,
-    },
+    Support,
     /// Show each product's current maintenance contract and runtime-state requirements.
-    Catalog {
-        #[arg(long)]
-        json: bool,
-    },
+    Catalog,
 }
 
 fn main() -> std::process::ExitCode {
@@ -64,33 +75,73 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let mut control = xssc::upgrade::SystemdControl::with_tool_lock(cli.tool_lock_fd)?;
+    match cli.command {
         Command::ApplyUpgrade { plan } => {
             let plan = xssc::upgrade::read_plan(&plan)?;
-            let result = xssc::upgrade::apply(&plan, &mut xssc::upgrade::SystemdControl)?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            let result = xssc::upgrade::apply(&plan, &mut control)?;
+            print_transaction(&result, "upgrade_complete");
             Ok(())
         }
         Command::InspectUpgrade { work_directory } => {
-            let result = xssc::upgrade::inspect_status(&work_directory)?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            let result = xssc::upgrade::inspect_coordinated(&work_directory, &mut control)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "operation_id":result.journal.operation_id,"phase":result.journal.phase,
+                    "product":result.journal.release.identity.product,"work_directory":result.journal.plan.work_directory,
+                    "installed_program":result.installed_program,"installed_binary_sha256":result.installed_binary_sha256,
+                    "persistent_state_verification":result.persistent_state_verification,
+                    "backup_complete":result.journal.backup_complete,
+                    "new_program_may_have_written":result.journal.new_program_may_have_written,
+                    "recovered_program_may_have_written":result.journal.recovered_program_may_have_written,
+                })
+            );
             Ok(())
         }
         Command::RecoverUpgrade {
             work_directory,
             allow_data_loss,
         } => {
-            let result = xssc::upgrade::recover(
-                &work_directory,
-                allow_data_loss,
-                &mut xssc::upgrade::SystemdControl,
-            )?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            let result = xssc::upgrade::recover(&work_directory, allow_data_loss, &mut control)?;
+            print_transaction(&result, "recovery_complete");
             Ok(())
         }
-        Command::Support { json } => print_support(json),
-        Command::Catalog { json } => print_catalog(json),
+        Command::CollectUpgrades {
+            root,
+            minimum_age_seconds,
+            keep_completed,
+            execute,
+            resume_collection,
+        } => {
+            let result = xssc::upgrade::collection::collect(
+                &root,
+                xssc::upgrade::collection::RetentionPolicy {
+                    minimum_age_seconds,
+                    keep_completed,
+                },
+                execute,
+                resume_collection,
+                &mut control,
+            )?;
+            println!("{result}");
+            Ok(())
+        }
+        Command::Support => print_support(cli.json),
+        Command::Catalog => print_catalog(cli.json),
     }
+}
+
+fn print_transaction(result: &xssc::upgrade::UpgradeJournal, status: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "operation_id":result.operation_id,"phase":result.phase,"status":status,
+            "product":result.release.identity.product,"version":if status=="recovery_complete" {&result.release.source_identity.version}else{&result.release.identity.version},
+            "work_directory":result.plan.work_directory,"backup_complete":result.backup_complete,
+        })
+    );
 }
 
 fn print_support(json: bool) -> anyhow::Result<()> {
@@ -101,7 +152,7 @@ fn print_support(json: bool) -> anyhow::Result<()> {
         for product in matrix.products {
             println!(
                 "{}\tupgrade={}\trecovery={}",
-                product.product, product.signed_release_upgrade, product.durable_recovery
+                product.product, product.release_upgrade, product.durable_recovery
             );
         }
     }

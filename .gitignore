@@ -3,3 +3,4 @@
 *.recovery-*
 
 __pycache__/
+/.release-build-tools/

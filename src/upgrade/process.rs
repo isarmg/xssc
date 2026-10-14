@@ -1,4 +1,4 @@
-//! Bounded child processes and explicit service-identity delegation.
+//! Bounded child processes and explicit administrator descriptor inheritance.
 //!
 //! No child output or unsafe process setup belongs to the upgrade state machine.
 
@@ -20,7 +20,21 @@ pub(super) fn run_bounded(
     arguments: &[String],
     timeout: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    run_bounded_delegated(program.as_ref(), arguments, timeout, None, None)
+    run_bounded_command(program.as_ref(), arguments, timeout, false, None, &[])
+}
+
+#[allow(unsafe_code)] // F_DUPFD_CLOEXEC creates an owned valid descriptor atomically.
+pub(super) fn duplicate_inherited_file(descriptor: i32) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    ensure!(
+        (3..1_048_576).contains(&descriptor),
+        "invalid tool lock descriptor"
+    );
+    let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 64) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(duplicate) })
 }
 
 pub(super) fn run_product(
@@ -28,58 +42,64 @@ pub(super) fn run_product(
     plan: &UpgradePlan,
     arguments: &[String],
     timeout: u64,
+    tool_lock: std::os::fd::BorrowedFd<'_>,
+    instances: &[(std::path::PathBuf, std::fs::File)],
 ) -> anyhow::Result<Vec<u8>> {
-    run_bounded_delegated(
+    let (uid, gid) = execution::identity(plan)?;
+    let mut arguments = arguments.to_vec();
+    arguments.extend([
+        "--service-uid".into(),
+        uid.to_string(),
+        "--service-gid".into(),
+        gid.to_string(),
+        "--tool-lock-fd".into(),
+        "5".into(),
+    ]);
+    for (index, (path, _)) in instances.iter().enumerate() {
+        arguments.extend([
+            "--instance-lock-fd".into(),
+            format!("{}={}", path.display(), 6 + index),
+        ]);
+    }
+    ensure!(
+        rustix::process::geteuid().as_raw() == 0,
+        "product maintenance requires administrator execution"
+    );
+    run_bounded_command(
         program,
-        arguments,
+        &arguments,
         timeout,
-        Some(execution::identity(plan)?),
-        None,
+        true,
+        Some(tool_lock),
+        instances,
     )
 }
 
-pub(super) fn run_product_diagnostic(
-    program: &Path,
-    plan: &UpgradePlan,
-    arguments: &[String],
-    timeout: u64,
-    environment: Option<(&str, &Path)>,
-) -> anyhow::Result<Vec<u8>> {
-    run_bounded_delegated(
-        program,
-        arguments,
-        timeout,
-        Some(execution::identity(plan)?),
-        environment,
-    )
-}
-
-#[allow(unsafe_code)] // Only the documented post-fork descriptor/identity boundary.
-pub(super) fn run_bounded_delegated(
+#[allow(unsafe_code)] // Only the documented post-fork descriptor boundary.
+fn run_bounded_command(
     program: &Path,
     arguments: &[String],
     timeout: u64,
-    identity: Option<(u32, u32)>,
-    environment: Option<(&str, &Path)>,
+    sealed: bool,
+    tool_lock: Option<std::os::fd::BorrowedFd<'_>>,
+    instances: &[(std::path::PathBuf, std::fs::File)],
 ) -> anyhow::Result<Vec<u8>> {
     use std::os::{
         fd::{AsFd, AsRawFd},
         unix::process::CommandExt,
     };
-    let executable = if identity.is_some() {
+    let executable = if sealed {
         let file = snapshot::open_regular(program)?;
         let metadata = file.metadata()?;
         ensure!(
             metadata.mode() & 0o7022 == 0 && metadata.mode() & 0o111 != 0,
             "product executable has unsafe permissions"
         );
-        if identity.is_some_and(|(uid, _)| uid != rustix::process::geteuid().as_raw()) {
-            ensure!(
-                metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
-                "delegated executable must be administrator controlled"
-            );
-            execution::require_trusted(program.parent().context("program parent missing")?)?;
-        }
+        ensure!(
+            metadata.uid() == 0,
+            "sealed executable must be administrator controlled"
+        );
+        execution::require_trusted(program.parent().context("program parent missing")?)?;
         Some(rustix::io::fcntl_dupfd_cloexec(&file, 64)?)
     } else {
         None
@@ -90,25 +110,35 @@ pub(super) fn run_bounded_delegated(
         program
     });
     if executable.is_some() {
-        command
-            .arg0(program)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("LANG", "C.UTF-8");
-        if let Some((name, value)) = environment {
-            command.env(name, value);
-        }
+        command.arg0(program);
     }
     command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("TZ", "UTC")
+        .process_group(0)
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let executable_fd = executable.as_ref().map(AsRawFd::as_raw_fd);
+    let tool_file = tool_lock
+        .map(|descriptor| rustix::io::fcntl_dupfd_cloexec(descriptor, 64))
+        .transpose()?;
+    let tool_fd = tool_file.as_ref().map(AsRawFd::as_raw_fd);
+    let instance_files = instances
+        .iter()
+        .map(|(_, file)| rustix::io::fcntl_dupfd_cloexec(file, 128))
+        .collect::<Result<Vec<_>, _>>()?;
+    let instance_fds = instance_files
+        .iter()
+        .map(AsRawFd::as_raw_fd)
+        .collect::<Vec<_>>();
     // SAFETY: the parent holds the verified executable descriptor until spawn
     // returns. After fork this closure performs only fixed descriptor and
-    // credential syscalls; it acquires no locks and allocates no storage.
-    // Supplementary groups are cleared before dropping gid and uid.
+    // descriptor syscalls; it acquires no locks and allocates no storage.
+    // Helpers retain administrator identity; service UID/GID are explicit data parameters.
     unsafe {
         command.pre_exec(move || {
             if let Some(source) = executable_fd
@@ -116,13 +146,16 @@ pub(super) fn run_bounded_delegated(
             {
                 return Err(std::io::Error::last_os_error());
             }
-            if let Some((uid, gid)) = identity
-                && libc::geteuid() == 0
-                && (libc::setgroups(0, std::ptr::null()) != 0
-                    || libc::setgid(gid) != 0
-                    || libc::setuid(uid) != 0)
+            if let Some(source) = tool_fd
+                && (libc::dup2(source, 5) < 0 || libc::fcntl(5, libc::F_SETFD, 0) < 0)
             {
                 return Err(std::io::Error::last_os_error());
+            }
+            for (index, source) in instance_fds.iter().enumerate() {
+                let target = 6 + index as i32;
+                if libc::dup2(*source, target) < 0 || libc::fcntl(target, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -179,6 +212,9 @@ pub(super) fn run_bounded_delegated(
         Ok(output)
     })();
     if result.is_err() {
+        if let Some(pid) = rustix::process::Pid::from_raw(process.id() as i32) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
         let _ = process.kill();
         let _ = process.wait();
     }

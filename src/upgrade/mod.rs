@@ -2,19 +2,20 @@
 //! validation; this module owns maintenance, snapshots, release switching and
 //! interruption recovery. No server runtime links this module.
 
+pub mod collection;
 mod execution;
 mod native_release;
 mod process;
-#[cfg(test)]
-mod product_tests;
+mod runtime_locks;
 mod snapshot;
+mod startup_control;
 pub use native_release::{NativeReleasePlan, ReleaseArtifact};
 #[cfg(test)]
 mod tests;
 
 use std::{
     collections::BTreeSet,
-    fs,
+    fs::{self, File},
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     os::unix::fs::MetadataExt,
@@ -24,10 +25,9 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use process::{run_bounded, run_product, run_product_diagnostic};
+use process::{run_bounded, run_product};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use snapshot::{Entry, PENDING};
+use snapshot::Entry;
 use uuid::Uuid;
 use xcsc::contracts::{ReleaseIdentity, SchemaIdentity};
 use xcsc::state_file::PrivateStateDirectory;
@@ -59,7 +59,7 @@ pub struct ReleaseResource {
     pub kind: ResourceType,
 }
 
-/// Signed as exact JSON bytes with an independently trusted Ed25519 key.
+/// Internal transaction derived from the checksum-verified exact package bytes.
 /// Resource names and schema identities are supplied by this tool's controlled
 /// release definition. A format conversion requires an explicit implementation;
 /// editing an identity cannot change the actual structure.
@@ -90,9 +90,11 @@ pub struct AdditionalService {
 /// A future release that changes persistent structure needs an implementation
 /// for that actual release. This tool currently preserves the exact contract.
 fn validate_state_transition(release: &UpgradeRelease) -> anyhow::Result<()> {
+    release.source_schema.validate()?;
+    release.target_schema.validate()?;
     ensure!(
-        release.source_schema == release.target_schema,
-        "a future structure change requires its own version's explicit implementation"
+        release.source_schema.application == release.target_schema.application,
+        "a verified transition cannot change the product owning the data"
     );
     Ok(())
 }
@@ -107,10 +109,7 @@ pub struct UpgradePlan {
     pub installed_binary: PathBuf,
     pub target_binary: PathBuf,
     pub release_manifest: PathBuf,
-    pub release_signature: PathBuf,
-    pub trusted_public_key: PathBuf,
-    /// DER SHA-256 obtained independently of the downloaded release bundle.
-    pub trusted_public_key_sha256: String,
+    pub release_checksum: PathBuf,
     pub config: PathBuf,
     pub data_dir: PathBuf,
     pub resources: Vec<PersistentResource>,
@@ -162,8 +161,11 @@ struct ResourceBackup {
 #[serde(deny_unknown_fields)]
 pub struct UpgradeJournal {
     pub journal_version: u32,
+    #[serde(deserialize_with = "canonical_operation")]
     pub operation_id: Uuid,
     pub phase: UpgradePhase,
+    pub completed_at_micros: Option<u64>,
+    pub recovery_outcome: Option<String>,
     pub plan: UpgradePlan,
     pub release: UpgradeRelease,
     pub original_binary_sha256: String,
@@ -173,11 +175,31 @@ pub struct UpgradeJournal {
     pub new_program_may_have_written: bool,
     pub recovered_program_may_have_written: bool,
     pub backup_complete: bool,
+    pub shared_paths: Vec<PathBuf>,
+    business_paths: Vec<PathBuf>,
+    runtime_locks: Vec<runtime_locks::Authority>,
     backups: Vec<ResourceBackup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_backup: Option<native_release::NativeBackup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    execution_seal: Option<execution::ExecutionSeal>,
+    work_directory_seal: Option<execution::StageAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_stage_seal: Option<execution::StageAuthority>,
+    startup_control: Option<startup_control::Authority>,
+}
+
+fn canonical_operation<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    let operation = Uuid::parse_str(&encoded).map_err(serde::de::Error::custom)?;
+    if operation.get_version_num() != 4 || operation.to_string() != encoded {
+        return Err(serde::de::Error::custom(
+            "operation must be a canonical v4 UUID",
+        ));
+    }
+    Ok(operation)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,7 +211,7 @@ pub struct UpgradeFailure {
 
 #[derive(Debug, thiserror::Error)]
 enum StructureFailure {
-    #[error("Existing data structure does not match the signed current-source structure")]
+    #[error("Existing data structure does not match the declared current-source structure")]
     Incompatible,
     #[error("Product read-only structure validation failed or produced unauthorized writes")]
     Validation,
@@ -209,7 +231,6 @@ pub struct UpgradeInspection {
     pub journal: UpgradeJournal,
     pub installed_program: &'static str,
     pub installed_binary_sha256: Option<String>,
-    pub maintenance_pending: bool,
     pub persistent_state_verification: &'static str,
 }
 
@@ -232,6 +253,19 @@ fn failure(code: &'static str, message: impl Into<String>, work: Option<&Path>) 
 /// exercise real filesystem transitions without manipulating the host service
 /// manager. Production always uses the systemd implementation below.
 pub trait ServiceControl {
+    fn inherited_tool_lock(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
+    fn bind_tool_lock(&mut self, _descriptor: std::os::fd::BorrowedFd<'_>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn bind_instance_locks(
+        &mut self,
+        _locks: &[(PathBuf, std::os::fd::BorrowedFd<'_>)],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn release_instance_locks(&mut self) {}
     fn verify_release_identity(
         &mut self,
         _binary: &Path,
@@ -243,8 +277,30 @@ pub trait ServiceControl {
     fn verify_service_identity(&mut self, _plan: &UpgradePlan) -> anyhow::Result<()> {
         Ok(())
     }
+    fn establish_startup_control(&mut self, _journal: &mut UpgradeJournal) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn verify_startup_control(&mut self, _journal: &UpgradeJournal) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn release_startup_control(&mut self, _journal: &mut UpgradeJournal) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _journal: &mut UpgradeJournal) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn is_stopped(&mut self, plan: &UpgradePlan) -> anyhow::Result<bool>;
     fn start(&mut self, plan: &UpgradePlan) -> anyhow::Result<()>;
+    fn start_recovered(&mut self, journal: &UpgradeJournal) -> anyhow::Result<&'static str> {
+        self.start(&journal.plan)?;
+        Ok("restored-ready-required")
+    }
+    fn configuration(
+        &mut self,
+        binary: &Path,
+        plan: &UpgradePlan,
+        artifact: Option<&ReleaseArtifact>,
+    ) -> anyhow::Result<serde_json::Value>;
     fn validate(
         &mut self,
         binary: &Path,
@@ -260,31 +316,82 @@ pub trait ServiceControl {
 }
 
 #[derive(Default)]
-pub struct SystemdControl;
+pub struct SystemdControl {
+    tool_lock: Option<File>,
+    instance_locks: Vec<(PathBuf, File)>,
+}
+
+impl SystemdControl {
+    pub fn with_tool_lock(descriptor: Option<i32>) -> anyhow::Result<Self> {
+        Ok(Self {
+            instance_locks: Vec::new(),
+            tool_lock: descriptor
+                .map(process::duplicate_inherited_file)
+                .transpose()?,
+        })
+    }
+    fn descriptor(&self) -> anyhow::Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Ok(self
+            .tool_lock
+            .as_ref()
+            .context("helper invocation lacks the installation tool lock")?
+            .as_fd())
+    }
+}
 
 impl ServiceControl for SystemdControl {
+    fn inherited_tool_lock(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.tool_lock.as_ref().map(AsFd::as_fd)
+    }
+    fn bind_tool_lock(&mut self, descriptor: std::os::fd::BorrowedFd<'_>) -> anyhow::Result<()> {
+        self.tool_lock = Some(File::from(rustix::io::dup(descriptor)?));
+        Ok(())
+    }
+    fn bind_instance_locks(
+        &mut self,
+        locks: &[(PathBuf, std::os::fd::BorrowedFd<'_>)],
+    ) -> anyhow::Result<()> {
+        self.instance_locks = locks
+            .iter()
+            .map(|(path, fd)| Ok((path.clone(), File::from(rustix::io::dup(*fd)?))))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(())
+    }
+    fn release_instance_locks(&mut self) {
+        self.instance_locks.clear();
+    }
     fn verify_release_identity(
         &mut self,
         binary: &Path,
         plan: &UpgradePlan,
         expected: &ReleaseIdentity,
     ) -> anyhow::Result<()> {
-        let bytes = run_product(
-            binary,
-            plan,
-            &["release-identity".into(), "--json".into()],
-            plan.timeout_seconds,
-        )?;
-        let identity: ReleaseIdentity = serde_json::from_slice(&bytes)?;
-        identity.validate()?;
+        // Verified metadata and complete payload verification own this identity.
+        // Product runtimes expose no offline identity or maintenance command.
+        expected.validate()?;
         ensure!(
-            identity == *expected,
-            "compiled release identity differs from signed authority"
+            snapshot::open_regular(binary)?.metadata()?.mode() & 0o111 != 0,
+            "verified product entrypoint is not executable"
         );
+        let _ = plan;
         Ok(())
     }
     fn verify_service_identity(&mut self, plan: &UpgradePlan) -> anyhow::Result<()> {
         execution::verify_service(plan)
+    }
+    fn establish_startup_control(&mut self, journal: &mut UpgradeJournal) -> anyhow::Result<()> {
+        startup_control::establish(journal)
+    }
+    fn verify_startup_control(&mut self, journal: &UpgradeJournal) -> anyhow::Result<()> {
+        startup_control::verify(journal)
+    }
+    fn release_startup_control(&mut self, journal: &mut UpgradeJournal) -> anyhow::Result<()> {
+        startup_control::release(journal)
+    }
+    fn stop(&mut self, journal: &mut UpgradeJournal) -> anyhow::Result<()> {
+        startup_control::stop(journal)
     }
     fn is_stopped(&mut self, plan: &UpgradePlan) -> anyhow::Result<bool> {
         let bytes = run_bounded(
@@ -317,29 +424,76 @@ impl ServiceControl for SystemdControl {
         Ok(())
     }
 
+    fn start_recovered(&mut self, journal: &UpgradeJournal) -> anyhow::Result<&'static str> {
+        let required = startup_control::original_required_services(journal)?;
+        for service in &required {
+            run_bounded(
+                "/usr/bin/systemctl",
+                &["start".into(), service.clone()],
+                journal.plan.timeout_seconds,
+            )?;
+        }
+        Ok(
+            if required.len() == journal.plan.additional_services.len() + 1 {
+                "restored-ready-required"
+            } else if required.is_empty() {
+                "restored-original-stopped"
+            } else {
+                "restored-original-partial"
+            },
+        )
+    }
+    fn configuration(
+        &mut self,
+        binary: &Path,
+        plan: &UpgradePlan,
+        artifact: Option<&ReleaseArtifact>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let helper = setup_for_binary(binary, plan, artifact)?;
+        let bytes = run_product(
+            &helper,
+            plan,
+            &[
+                "--product".into(),
+                service_product(plan)?,
+                "--root".into(),
+                installation_root(plan)?.to_string_lossy().into_owned(),
+                "--config".into(),
+                plan.config.to_string_lossy().into_owned(),
+                "--json".into(),
+                "config-validate".into(),
+            ],
+            plan.timeout_seconds,
+            self.descriptor()?,
+            &self.instance_locks,
+        )?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     fn validate(
         &mut self,
         binary: &Path,
         plan: &UpgradePlan,
         artifact: Option<&ReleaseArtifact>,
     ) -> anyhow::Result<ValidatedState> {
-        let environment = native_release::diagnostic_environment(binary, artifact)?;
-        let bytes = run_product_diagnostic(
-            binary,
+        let helper = setup_for_binary(binary, plan, artifact)?;
+        let root = installation_root(plan)?;
+        let bytes = run_product(
+            &helper,
             plan,
             &[
-                "config".into(),
-                "validate".into(),
+                "--product".into(),
+                service_product(plan)?,
+                "--root".into(),
+                root.to_string_lossy().into_owned(),
                 "--config".into(),
                 plan.config.to_string_lossy().into_owned(),
-                "--data-dir".into(),
-                plan.data_dir.to_string_lossy().into_owned(),
                 "--json".into(),
+                "check".into(),
             ],
             plan.timeout_seconds,
-            environment
-                .as_ref()
-                .map(|(name, root)| (name.as_str(), root.as_path())),
+            self.descriptor()?,
+            &self.instance_locks,
         )?;
         parse_validated_state(&bytes)
     }
@@ -353,8 +507,78 @@ impl ServiceControl for SystemdControl {
         if !running_program_matches(plan, binary_sha256)? {
             return Ok(false);
         }
+        let package = native_release::current_package(plan)?;
+        for writer in &plan.additional_services {
+            ensure!(
+                package.identity.product == "xcos"
+                    && writer.role == "media"
+                    && writer.service == "xcos-mediamtx.service",
+                "additional writer has no declared executable mapping"
+            );
+            let path = Path::new("bin/mediamtx");
+            let file = package
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .context("verified MediaMTX executable is absent")?;
+            let mut media = plan.clone();
+            media.service = writer.service.clone();
+            media.additional_services.clear();
+            media.installed_binary = installation_root(plan)?.join(path);
+            if !running_program_matches(&media, &file.sha256)? {
+                return Ok(false);
+            }
+        }
         http_ready(plan.readiness_address, service_identity)
     }
+}
+
+fn installation_root(plan: &UpgradePlan) -> anyhow::Result<PathBuf> {
+    let native = plan
+        .native_release
+        .as_ref()
+        .context("fixed installation root is required")?;
+    let root = native.root.clone();
+    snapshot::require_path(&root)?;
+    Ok(root)
+}
+
+fn service_product(plan: &UpgradePlan) -> anyhow::Result<String> {
+    let product = plan
+        .service
+        .strip_suffix(".service")
+        .context("service name is invalid")?;
+    ensure!(
+        matches!(product, "xcos" | "xczs" | "xocs" | "xscs" | "xsos" | "xszs"),
+        "service does not belong to a supported product"
+    );
+    Ok(product.to_owned())
+}
+
+fn setup_for_binary(
+    binary: &Path,
+    plan: &UpgradePlan,
+    artifact: Option<&ReleaseArtifact>,
+) -> anyhow::Result<PathBuf> {
+    if binary == native_release::installed_binary(plan)? {
+        return Ok(installation_root(plan)?.join("libexec/setup"));
+    }
+    let artifact = artifact.context("verified target payload is missing")?;
+    let entrypoint = &artifact.entrypoint;
+    let helper = &artifact.setup;
+    ensure!(
+        helper == Path::new("libexec/setup"),
+        "uncontrolled offline helper path"
+    );
+    let root = binary
+        .ancestors()
+        .nth(entrypoint.components().count())
+        .context("sealed payload root cannot be resolved")?;
+    ensure!(
+        root.join(entrypoint) == binary,
+        "entrypoint differs from verified sealed tree"
+    );
+    Ok(root.join(helper))
 }
 
 fn stopped_service_report(bytes: &[u8]) -> anyhow::Result<bool> {
@@ -438,6 +662,29 @@ fn running_program_matches(plan: &UpgradePlan, binary_sha256: &str) -> anyhow::R
     {
         return Ok(false);
     }
+    let mut command = Vec::new();
+    fs::File::open(format!("/proc/{pid}/cmdline"))?
+        .take(16385)
+        .read_to_end(&mut command)?;
+    ensure!(command.len() <= 16384, "running command exceeds its bound");
+    let mut arguments = command.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if arguments.last() == Some(&&[][..]) {
+        arguments.pop();
+    }
+    let root = installation_root(plan)?;
+    let expected = if plan.service == "xcos-mediamtx.service" {
+        vec![executable.clone(), root.join("config/mediamtx.yml")]
+    } else {
+        vec![executable.clone(), PathBuf::from("--root"), root]
+    };
+    if arguments
+        != expected
+            .iter()
+            .map(|argument| argument.as_os_str().as_encoded_bytes())
+            .collect::<Vec<_>>()
+    {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -495,12 +742,10 @@ fn validate_plan(plan: &UpgradePlan) -> anyhow::Result<()> {
             "duplicate writer service or role"
         );
     }
-    validate_digest(&plan.trusted_public_key_sha256)?;
     for path in [
         &plan.target_binary,
         &plan.release_manifest,
-        &plan.release_signature,
-        &plan.trusted_public_key,
+        &plan.release_checksum,
         &plan.config,
         &plan.data_dir,
         &plan.work_directory,
@@ -548,8 +793,7 @@ fn validate_plan(plan: &UpgradePlan) -> anyhow::Result<()> {
             &plan.installed_binary,
             &plan.target_binary,
             &plan.release_manifest,
-            &plan.release_signature,
-            &plan.trusted_public_key,
+            &plan.release_checksum,
         ] {
             ensure!(
                 !other.starts_with(&resource.path) && !resource.path.starts_with(other),
@@ -625,59 +869,9 @@ pub fn verify_release(plan: &UpgradePlan) -> Result<UpgradeRelease, UpgradeFailu
     let verified = (|| -> anyhow::Result<UpgradeRelease> {
         validate_plan(plan)?;
         let manifest_bytes = snapshot::read_bounded(&plan.release_manifest, MAX_JSON)?;
-        let signature = snapshot::read_bounded(&plan.release_signature, 64)?;
-        ensure!(signature.len() == 64, "signature must be Ed25519");
-        // Convert the public key before comparing its independently pinned DER
-        // fingerprint. A bundle's self-declared hash is never the trust anchor.
-        let key_bytes = snapshot::read_bounded(&plan.trusted_public_key, 8192)?;
-        let key = tempfile::NamedTempFile::new()?;
-        fs::write(key.path(), key_bytes)?;
-        let der = run_bounded(
-            "/usr/bin/openssl",
-            &[
-                "pkey".into(),
-                "-pubin".into(),
-                "-in".into(),
-                key.path().to_string_lossy().into_owned(),
-                "-outform".into(),
-                "DER".into(),
-            ],
-            plan.timeout_seconds,
-        )?;
-        ensure!(
-            digest_hex(Sha256::digest(&der)) == plan.trusted_public_key_sha256,
-            "trusted public key fingerprint differs"
-        );
-        // Ed25519 SubjectPublicKeyInfo has a fixed 12-byte prefix and 32-byte key.
-        ensure!(
-            der.len() == 44
-                && der[..12]
-                    == [
-                        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00
-                    ],
-            "only Ed25519 release keys are supported"
-        );
-        let manifest = tempfile::NamedTempFile::new()?;
-        fs::write(manifest.path(), &manifest_bytes)?;
-        let detached = tempfile::NamedTempFile::new()?;
-        fs::write(detached.path(), signature)?;
-        run_bounded(
-            "/usr/bin/openssl",
-            &[
-                "pkeyutl".into(),
-                "-verify".into(),
-                "-pubin".into(),
-                "-inkey".into(),
-                key.path().to_string_lossy().into_owned(),
-                "-rawin".into(),
-                "-in".into(),
-                manifest.path().to_string_lossy().into_owned(),
-                "-sigfile".into(),
-                detached.path().to_string_lossy().into_owned(),
-            ],
-            plan.timeout_seconds,
-        )?;
-        let release: UpgradeRelease = serde_json::from_slice(&manifest_bytes)?;
+        let checksum = snapshot::read_bounded(&plan.release_checksum, 65)?;
+        native_release::verify_checksum(&manifest_bytes, &checksum)?;
+        let release = native_release::package_to_release(plan, &manifest_bytes)?;
         ensure!(
             release.manifest_version == 1,
             "unsupported release contract"
@@ -723,12 +917,12 @@ pub fn verify_release(plan: &UpgradePlan) -> Result<UpgradeRelease, UpgradeFailu
         );
         ensure!(
             release.additional_service_roles.len() <= 16,
-            "too many signed writer roles"
+            "too many declared writer roles"
         );
         let mut roles = BTreeSet::new();
         for role in &release.additional_service_roles {
             validate_service_role(role)?;
-            ensure!(roles.insert(role), "duplicate signed writer role");
+            ensure!(roles.insert(role), "duplicate declared writer role");
         }
         ensure!(
             release.additional_service_roles
@@ -737,7 +931,7 @@ pub fn verify_release(plan: &UpgradePlan) -> Result<UpgradeRelease, UpgradeFailu
                     .iter()
                     .map(|entry| entry.role.clone())
                     .collect::<Vec<_>>(),
-            "plan does not cover signed additional writer roles"
+            "plan does not cover declared additional writer roles"
         );
         let actual = plan
             .resources
@@ -751,14 +945,16 @@ pub fn verify_release(plan: &UpgradePlan) -> Result<UpgradeRelease, UpgradeFailu
             .collect::<Vec<_>>();
         ensure!(
             actual == expected,
-            "persistent resource coverage differs from signed product definition"
+            "persistent resource coverage differs from declared product definition"
         );
         Ok(release)
     })();
-    verified.map_err(|_| {
+    verified.map_err(|_error| {
+        #[cfg(test)]
+        eprintln!("verified package validation: {_error:#}");
         failure(
             "ARTIFACT_UNTRUSTED",
-            "Target artifact signature, trust anchor, platform, release identity or resource definition validation failed.",
+            "Target artifact SHA256, platform, release identity or resource definition validation failed.",
             Some(&plan.work_directory),
         )
     })
@@ -799,19 +995,6 @@ fn all_stopped(plan: &UpgradePlan, control: &mut impl ServiceControl) -> anyhow:
     }
     Ok(true)
 }
-fn require_stopped(
-    plan: &UpgradePlan,
-    control: &mut impl ServiceControl,
-) -> Result<(), UpgradeFailure> {
-    if !all_stopped(plan, control).unwrap_or(false) {
-        return Err(failure(
-            "SERVER_MUST_BE_STOPPED",
-            "Services or related data writers have not been confirmed stopped. Stop all declared instances and disable automatic restart by other managers before running offline maintenance; this tool does not stop services.",
-            Some(&plan.work_directory),
-        ));
-    }
-    Ok(())
-}
 
 pub fn apply(
     plan: &UpgradePlan,
@@ -821,15 +1004,14 @@ pub fn apply(
     if validate_state_transition(&release).is_err() {
         return Err(failure(
             "STATE_INCOMPATIBLE",
-            "This future release changes the state contract without providing an explicit conversion for that version; original state was not modified.",
+            "The release state contract differs from the current installation; original state was not modified.",
             Some(&plan.work_directory),
         ));
     }
-    require_stopped(plan, control)?;
     let original = native_release::installed_binary(plan).map_err(|_| {
         failure(
             "CURRENT_RELEASE_INCOMPATIBLE",
-            "The current program or complete release-directory identity could not be verified; maintenance was not entered.",
+            "The current program or verified source payload identity could not be verified; maintenance was not entered.",
             None,
         )
     })?;
@@ -838,37 +1020,43 @@ pub fn apply(
         .map_err(|_| {
             failure(
                 "CURRENT_RELEASE_INCOMPATIBLE",
-                "The current program compiled release identity does not match the signed current baseline; maintenance was not entered.",
+                "The installed verified package identity or declared immutable payload does not match the current baseline; maintenance was not entered.",
                 None,
             )
         })?;
-    let _instance_upgrade = coordinator_lock(&plan.data_dir).map_err(|_| {
+    let _release_upgrade = native_release::coordinate(plan, control.inherited_tool_lock()).map_err(|_| {
         failure(
             "MAINTENANCE_BUSY",
-            "Another upgrade process is maintaining this data directory.",
+            "The fixed installation root is in use by another maintenance process or its control directory is unsafe.",
             Some(&plan.work_directory),
         )
     })?;
-    let _release_upgrade = native_release::coordinate(plan).map_err(|_| {
-        failure(
-            "MAINTENANCE_BUSY",
-            "The release directory is in use by another maintenance process, or the selector directory is unsafe.",
-            Some(&plan.work_directory),
-        )
-    })?;
-    let mut journal = (|| -> anyhow::Result<UpgradeJournal> {
-        ensure!(
-            !plan.data_dir.join(PENDING).exists(),
-            "another interrupted upgrade is pending"
-        );
+    if let Some(lock) = &_release_upgrade {
+        control.bind_tool_lock(lock.descriptor()).map_err(|_| {
+            failure(
+                "MAINTENANCE_BUSY",
+                "Cannot bind the installation tool lock.",
+                Some(&plan.work_directory),
+            )
+        })?;
+    }
+    let mut precheck_journal = None;
+    let preflight = (|| -> anyhow::Result<()> {
         PrivateStateDirectory::open_for_administration(&plan.data_dir)?;
         control.verify_service_identity(plan)?;
         snapshot::private_directory(&plan.work_directory)?;
         let installed = native_release::installed_binary(plan)?;
-        let mut journal = UpgradeJournal {
+        let journal = UpgradeJournal {
             journal_version: 1,
-            operation_id: Uuid::new_v4(),
+            operation_id: Uuid::parse_str(
+                plan.work_directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("operation directory UUID is missing")?,
+            )?,
             phase: UpgradePhase::Prechecked,
+            completed_at_micros: None,
+            recovery_outcome: None,
             plan: plan.clone(),
             release,
             original_binary_sha256: snapshot::digest_file(&installed)?,
@@ -876,39 +1064,53 @@ pub fn apply(
             new_program_may_have_written: false,
             recovered_program_may_have_written: false,
             backup_complete: false,
+            shared_paths: Vec::new(),
+            business_paths: Vec::new(),
+            runtime_locks: Vec::new(),
             backups: Vec::new(),
             native_backup: None,
-            execution_seal: None,
+            work_directory_seal: Some(execution::work_authority(plan)?),
+            payload_stage_seal: None,
+            startup_control: None,
         };
-        execution::prepare(&mut journal)?;
-        if journal.release.artifact.is_some() {
-            native_release::seal(&mut journal)?;
-        } else {
-            snapshot::copy_regular(
-                &plan.target_binary,
-                &native_release::staged_binary(&journal)?,
-                if journal.execution_seal.is_some() {
-                    0o555
-                } else {
-                    0o500
-                },
-            )?;
-        }
-        let staged_target = native_release::staged_binary(&journal)?;
+        precheck_journal = Some(journal);
+        let journal = precheck_journal
+            .as_mut()
+            .context("precheck journal is missing")?;
+        save(journal)?;
+        execution::prepare(journal)?;
+        // Persist the inode-bound staging authority before copying executable
+        // payload. An interrupted precheck remains explicitly recoverable.
+        save(journal)?;
+        native_release::seal(journal)?;
+        let staged_target = native_release::staged_binary(journal)?;
         ensure!(
             snapshot::digest_file(&staged_target)? == journal.release.binary_sha256,
             "target changed while staging"
         );
-        // The signed artifact is the tool-owned deployment authority.
+        // The verified artifact is the tool-owned deployment authority.
         // Ordinary compiled release identity is checked before any state change.
         control.verify_release_identity(&staged_target, plan, &journal.release.identity)?;
-        save(&journal)?;
-        Ok(journal)
-    })()
-    .map_err(|_| {
-        failure(
+        save(journal)?;
+        Ok(())
+    })();
+    if preflight.is_err() {
+        if let Some(journal) = &mut precheck_journal
+            && execution::cleanup_precheck(journal).is_ok()
+        {
+            journal.payload_stage_seal = None;
+            let _ = transition(journal, UpgradePhase::RolledBack);
+        }
+        return Err(failure(
             "UPGRADE_PRECONDITION_FAILED",
             "Upgrade preflight failed; check paths, service-user permissions and existing recovery records.",
+            Some(&plan.work_directory),
+        ));
+    }
+    let mut journal = precheck_journal.ok_or_else(|| {
+        failure(
+            "UPGRADE_PRECONDITION_FAILED",
+            "Upgrade preflight did not produce a complete journal.",
             Some(&plan.work_directory),
         )
     })?;
@@ -927,6 +1129,7 @@ pub fn apply(
         )
     })?;
     let result = apply_inner(&mut journal, control);
+    control.release_instance_locks();
     result.map_err(|error| {
         let code = match error.downcast_ref::<StructureFailure>() {
             Some(StructureFailure::Incompatible) => "STATE_INCOMPATIBLE",
@@ -939,47 +1142,19 @@ pub fn apply(
     Ok(journal)
 }
 
-struct StateLock {
-    file: xcsc::state_file::SecureStateFile,
-}
-
-impl StateLock {
-    fn acquire(file: xcsc::state_file::SecureStateFile) -> anyhow::Result<Self> {
-        rustix::fs::flock(
-            file.file(),
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )?;
-        let guard = Self { file };
-        guard.file.verify_identity()?;
-        Ok(guard)
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        // Unlock the description we acquired even if another process briefly
-        // inherited a descriptor before exec. Keep the persistent lock inode.
-        let _ = rustix::fs::flock(self.file.file(), rustix::fs::FlockOperation::Unlock);
-    }
-}
-
-fn coordinator_lock(data_dir: &Path) -> anyhow::Result<StateLock> {
-    let directory = PrivateStateDirectory::open_for_administration(data_dir)?;
-    StateLock::acquire(directory.create_file(snapshot::COORDINATOR)?)
-}
-
 fn apply_inner(
     journal: &mut UpgradeJournal,
     control: &mut impl ServiceControl,
 ) -> anyhow::Result<()> {
     transition(journal, UpgradePhase::MaintenanceIntent)?;
-    gate(journal)?;
+    control.establish_startup_control(journal)?;
+    control.stop(journal)?;
+    control.verify_startup_control(journal)?;
     ensure!(
         all_stopped(&journal.plan, control)?,
         "service remains active"
     );
     let state = PrivateStateDirectory::open_for_administration(&journal.plan.data_dir)?;
-    let maintenance = state.try_maintenance_lock()?;
     ensure!(
         all_stopped(&journal.plan, control)?,
         "service restarted during maintenance acquisition"
@@ -990,6 +1165,67 @@ fn apply_inner(
             == journal.original_binary_sha256,
         "installed binary changed since precheck"
     );
+    let configuration = control.configuration(
+        &native_release::installed_binary(&journal.plan)?,
+        &journal.plan,
+        journal.release.artifact.as_ref(),
+    )?;
+    let root = installation_root(&journal.plan)?;
+    if configuration.get("root") != Some(&serde_json::to_value(&root)?)
+        || configuration.get("product")
+            != Some(&serde_json::to_value(&journal.release.identity.product)?)
+        || configuration.get("data_dir") != Some(&serde_json::to_value(&journal.plan.data_dir)?)
+        || journal.plan.config != root.join("config/config.json")
+    {
+        return Err(StructureFailure::ResourceCoverage.into());
+    }
+    let declared: Vec<PathBuf> = serde_json::from_value(
+        configuration
+            .get("state_paths")
+            .context("configuration does not declare state roots")?
+            .clone(),
+    )?;
+    validate_coverage(&declared, &journal.plan)?;
+    journal.shared_paths = serde_json::from_value(
+        configuration
+            .get("shared_paths")
+            .context("configuration does not declare shared roots")?
+            .clone(),
+    )?;
+    validate_shared_policy(
+        &journal.shared_paths,
+        &journal.plan,
+        &journal.release.identity.product,
+    )?;
+    journal.business_paths = serde_json::from_value(
+        configuration
+            .get("business_paths")
+            .context("configuration lacks business roots")?
+            .clone(),
+    )?;
+    let lock_paths: Vec<runtime_locks::Declaration> = serde_json::from_value(
+        configuration
+            .get("runtime_locks")
+            .context("configuration lacks runtime locks")?
+            .clone(),
+    )?;
+    let held = runtime_locks::acquire(
+        &journal.plan,
+        &lock_paths,
+        &journal.business_paths,
+        &journal.runtime_locks,
+    )?;
+    journal.runtime_locks = held.iter().map(|lock| lock.authority.clone()).collect();
+    control.bind_instance_locks(
+        &held
+            .iter()
+            .map(|lock| {
+                use std::os::fd::AsFd;
+                (lock.authority.path.clone(), lock.file.as_fd())
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    save(journal)?;
     transition(journal, UpgradePhase::BackupStarted)?;
     snapshot::copy_regular(
         &native_release::installed_binary(&journal.plan)?,
@@ -1000,23 +1236,17 @@ fn apply_inner(
         snapshot::open_regular(&native_release::installed_binary(&journal.plan)?)?
             .metadata()?
             .len();
-    if journal.native_backup.is_some() {
-        backup_bytes = backup_bytes
-            .checked_add(native_release::backup_original(journal)?)
-            .context("complete backup size overflow")?;
-        ensure!(
-            backup_bytes <= journal.plan.max_backup_bytes,
-            "complete backup exceeds declared byte limit"
-        );
-    }
+    backup_bytes = backup_bytes
+        .checked_add(native_release::backup_original(journal)?)
+        .context("complete backup size overflow")?;
+    ensure!(
+        backup_bytes <= journal.plan.max_backup_bytes,
+        "complete backup exceeds declared byte limit"
+    );
     for (index, resource) in journal.plan.resources.iter().enumerate() {
+        runtime_locks::verify(&held)?;
         let primary = resource.path == journal.plan.data_dir;
-        let entries = snapshot::inventory(
-            &resource.path,
-            resource.kind == ResourceType::Directory,
-            journal.plan.max_backup_bytes,
-            primary,
-        )?;
+        let entries = resource_inventory(journal, resource, &resource.path, primary)?;
         for entry in &entries {
             backup_bytes = backup_bytes
                 .checked_add(entry.bytes)
@@ -1035,13 +1265,7 @@ fn apply_inner(
             &entries,
         )?;
         ensure!(
-            entries
-                == snapshot::inventory(
-                    &resource.path,
-                    resource.kind == ResourceType::Directory,
-                    journal.plan.max_backup_bytes,
-                    primary
-                )?,
+            entries == resource_inventory(journal, resource, &resource.path, primary)?,
             "state changed during backup"
         );
         journal.backups.push(ResourceBackup {
@@ -1088,6 +1312,7 @@ fn apply_inner(
         return Err(StructureFailure::Validation.into());
     }
     validate_coverage(&target.state_paths, &journal.plan)?;
+    verify_unchanged(journal).map_err(|_| StructureFailure::Validation)?;
     if before_validation != inventory_current(journal)? {
         return Err(StructureFailure::Validation.into());
     }
@@ -1097,23 +1322,17 @@ fn apply_inner(
     );
     transition(journal, UpgradePhase::Validated)?;
     state.verify_identity()?;
+    runtime_locks::verify(&held)?;
     transition(journal, UpgradePhase::SwitchIntent)?;
-    if journal.native_backup.is_some() {
-        native_release::install_target(journal)?;
-    } else {
-        install(
-            &staged_target,
-            &journal.plan.installed_binary,
-            &journal.release.binary_sha256,
-            journal.original_binary_mode,
-        )?;
-    }
+    native_release::install_target(journal)?;
     transition(journal, UpgradePhase::Switched)?;
-    // Persist possible writes before removing the gate and releasing the lock.
+    // Persist possible writes before handing execution to the service manager.
     journal.new_program_may_have_written = true;
     transition(journal, UpgradePhase::StartIntent)?;
-    clear_gate(journal)?;
-    maintenance.release()?;
+    runtime_locks::verify(&held)?;
+    control.release_instance_locks();
+    drop(held);
+    control.release_startup_control(journal)?;
     control.start(&journal.plan)?;
     wait_ready(journal, control, &journal.release.binary_sha256)?;
     transition(journal, UpgradePhase::Ready)
@@ -1134,27 +1353,92 @@ fn validate_coverage(paths: &[PathBuf], plan: &UpgradePlan) -> anyhow::Result<()
             return Err(StructureFailure::ResourceCoverage.into());
         }
     }
+    // A plan must not broaden a declared helper's data roots or add unrelated
+    // protected directories. Normalize nested declarations before matching;
+    // the install's fixed configuration file is the only implicit resource.
+    let mut declared = paths.to_vec();
+    if !declared.contains(&plan.config) {
+        declared.push(plan.config.clone());
+    }
+    declared.sort_by_key(|path| (path.components().count(), path.clone()));
+    declared.dedup();
+    let mut minimal = Vec::<PathBuf>::new();
+    for path in declared {
+        if !minimal
+            .iter()
+            .any(|parent| parent.is_dir() && path.starts_with(parent))
+        {
+            minimal.push(path);
+        }
+    }
+    if plan.resources.len() != minimal.len()
+        || plan.resources.iter().any(|resource| {
+            !minimal.contains(&resource.path)
+                || match resource.kind {
+                    ResourceType::File => !resource.path.is_file(),
+                    ResourceType::Directory => !resource.path.is_dir(),
+                }
+        })
+    {
+        return Err(StructureFailure::ResourceCoverage.into());
+    }
     Ok(())
 }
 
-fn install(source: &Path, target: &Path, digest: &str, mode: u32) -> anyhow::Result<()> {
+fn validate_shared_policy(
+    paths: &[PathBuf],
+    plan: &UpgradePlan,
+    product: &str,
+) -> anyhow::Result<()> {
+    ensure!(paths.len() <= 16, "too many shared roots");
     ensure!(
-        snapshot::digest_file(source)? == digest,
-        "release changed before switch"
+        paths.is_empty() || product == "xczs",
+        "product does not declare shared file ownership"
     );
-    let stage = target.with_file_name(format!(".upgrade-binary-{}", Uuid::new_v4()));
-    snapshot::copy_regular(source, &stage, mode)?;
-    ensure!(
-        snapshot::digest_file(&stage)? == digest,
-        "staged release checksum differs"
-    );
-    fs::rename(&stage, target)?;
-    snapshot::sync_parent(target)?;
-    ensure!(
-        snapshot::digest_file(target)? == digest,
-        "installed release checksum differs"
-    );
+    let mut unique = BTreeSet::new();
+    let configuration = installation_root(plan)?.join("config");
+    let logs = installation_root(plan)?.join("logs");
+    for path in paths {
+        snapshot::require_path(path)?;
+        ensure!(unique.insert(path), "duplicate shared root");
+        ensure!(
+            plan.resources
+                .iter()
+                .any(|resource| resource.path == *path && resource.kind == ResourceType::Directory),
+            "shared root is not an exact protected directory"
+        );
+        ensure!(
+            !path.starts_with(&plan.data_dir)
+                && !plan.data_dir.starts_with(path)
+                && !path.starts_with(&configuration)
+                && !configuration.starts_with(path)
+                && !path.starts_with(&logs)
+                && !logs.starts_with(path),
+            "shared data cannot relax private state or configuration"
+        );
+    }
     Ok(())
+}
+
+fn resource_inventory(
+    journal: &UpgradeJournal,
+    resource: &PersistentResource,
+    path: &Path,
+    primary: bool,
+) -> anyhow::Result<Vec<Entry>> {
+    let excluded = if path == resource.path {
+        runtime_locks::file_paths(&journal.runtime_locks)
+    } else {
+        Vec::new()
+    };
+    snapshot::inventory_preserving(
+        path,
+        resource.kind == ResourceType::Directory,
+        journal.plan.max_backup_bytes,
+        primary,
+        journal.shared_paths.contains(&resource.path),
+        &excluded,
+    )
 }
 
 fn wait_ready(
@@ -1187,6 +1471,16 @@ fn save(journal: &UpgradeJournal) -> anyhow::Result<()> {
 
 fn transition(journal: &mut UpgradeJournal, phase: UpgradePhase) -> anyhow::Result<()> {
     journal.phase = phase;
+    journal.completed_at_micros = if matches!(phase, UpgradePhase::Ready | UpgradePhase::RolledBack)
+    {
+        Some(u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_micros(),
+        )?)
+    } else {
+        None
+    };
     save(journal)?;
     xcsc::log::LogRecord::client(
         "xssc",
@@ -1199,51 +1493,6 @@ fn transition(journal: &mut UpgradeJournal, phase: UpgradePhase) -> anyhow::Resu
     .with_attribute("phase", serde_json::to_value(phase)?)?
     .with_attribute("product", journal.release.identity.product.clone())?
     .emit_stderr()?;
-    Ok(())
-}
-
-fn gate(journal: &UpgradeJournal) -> anyhow::Result<()> {
-    let path = journal.plan.data_dir.join(PENDING);
-    if let Ok(bytes) = snapshot::read_bounded(&path, MAX_JSON) {
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-        ensure!(
-            value.get("operation_id") == Some(&serde_json::to_value(journal.operation_id)?),
-            "another upgrade owns the pending gate"
-        );
-    } else {
-        ensure!(
-            fs::symlink_metadata(&path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-            "pending gate cannot be safely read"
-        );
-    }
-    let directory =
-        xcsc::fs_safety::PrivateDirectory::open_for_administration(&journal.plan.data_dir)?;
-    xcsc::fs_safety::AtomicFile::replace(
-        &directory,
-        &xcsc::fs_safety::RelativePath::new(PENDING)?,
-        &serde_json::to_vec(&serde_json::json!({
-            "journal_version": 1, "operation_id": journal.operation_id,
-            "work_directory": journal.plan.work_directory, "phase": journal.phase,
-            "data_dir": journal.plan.data_dir,
-            "data_directory_device": fs::symlink_metadata(&journal.plan.data_dir)?.dev(),
-            "data_directory_inode": fs::symlink_metadata(&journal.plan.data_dir)?.ino(),
-            "target_binary_sha256": journal.release.binary_sha256,
-        }))?,
-    )?;
-    Ok(())
-}
-
-fn clear_gate(journal: &UpgradeJournal) -> anyhow::Result<()> {
-    let path = journal.plan.data_dir.join(PENDING);
-    let bytes = snapshot::read_bounded(&path, MAX_JSON)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    ensure!(
-        value.get("operation_id") == Some(&serde_json::to_value(journal.operation_id)?),
-        "pending gate ownership differs"
-    );
-    xcsc::fs_safety::PrivateDirectory::open_for_administration(&journal.plan.data_dir)?
-        .remove_file(&xcsc::fs_safety::EntryName::new(PENDING)?)?;
     Ok(())
 }
 
@@ -1263,17 +1512,13 @@ fn verify_backups(journal: &UpgradeJournal) -> anyhow::Result<()> {
             backup.resource == journal.plan.resources[index],
             "backup mapping differs"
         );
+        snapshot::validate_ownership(&backup.entries, &backup.ownership)?;
         let path = journal
             .plan
             .work_directory
             .join(format!("resource-{index}"));
         ensure!(
-            snapshot::inventory(
-                &path,
-                backup.resource.kind == ResourceType::Directory,
-                journal.plan.max_backup_bytes,
-                false
-            )? == backup.entries,
+            resource_inventory(journal, &backup.resource, &path, false)? == backup.entries,
             "backup inventory differs"
         );
     }
@@ -1286,10 +1531,10 @@ fn inventory_current(journal: &UpgradeJournal) -> anyhow::Result<Vec<Vec<Entry>>
         .resources
         .iter()
         .map(|resource| {
-            snapshot::inventory(
+            resource_inventory(
+                journal,
+                resource,
                 &resource.path,
-                resource.kind == ResourceType::Directory,
-                journal.plan.max_backup_bytes,
                 resource.path == journal.plan.data_dir,
             )
         })
@@ -1298,15 +1543,16 @@ fn inventory_current(journal: &UpgradeJournal) -> anyhow::Result<Vec<Vec<Entry>>
 
 fn verify_unchanged(journal: &UpgradeJournal) -> anyhow::Result<()> {
     for backup in &journal.backups {
+        let current = snapshot::ownership(&backup.resource.path, &backup.entries)?;
         ensure!(
-            snapshot::ownership(&backup.resource.path, &backup.entries)? == backup.ownership,
-            "state ownership changed"
+            current == backup.ownership,
+            "state ownership, ACL or modification time changed"
         );
         ensure!(
-            snapshot::inventory(
+            resource_inventory(
+                journal,
+                &backup.resource,
                 &backup.resource.path,
-                backup.resource.kind == ResourceType::Directory,
-                journal.plan.max_backup_bytes,
                 backup.resource.path == journal.plan.data_dir
             )? == backup.entries,
             "validator or another writer modified state"
@@ -1327,10 +1573,30 @@ pub fn inspect(work_directory: &Path) -> Result<UpgradeJournal, UpgradeFailure> 
             "journal identity differs"
         );
         validate_plan(&journal.plan)?;
-        execution::verify(&journal)?;
+        ensure!(
+            work_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| journal.operation_id.to_string() == name),
+            "journal operation does not match its canonical work directory"
+        );
+        validate_shared_policy(
+            &journal.shared_paths,
+            &journal.plan,
+            &journal.release.identity.product,
+        )?;
+        if journal.phase == UpgradePhase::Prechecked {
+            execution::verify_precheck(&journal)?;
+        } else {
+            execution::verify(&journal)?;
+        }
         native_release::validate_artifact(&journal.plan, &journal.release)?;
         ensure!(
-            journal.native_backup.is_some() == journal.release.artifact.is_some(),
+            journal.native_backup.is_some()
+                || matches!(
+                    journal.phase,
+                    UpgradePhase::Prechecked | UpgradePhase::RolledBack
+                ),
             "native journal mapping differs"
         );
         validate_digest(&journal.original_binary_sha256)?;
@@ -1344,7 +1610,7 @@ pub fn inspect(work_directory: &Path) -> Result<UpgradeJournal, UpgradeFailure> 
                     .iter()
                     .map(|entry| entry.role.clone())
                     .collect::<Vec<_>>(),
-            "journal additional writer mapping differs from signed release"
+            "journal additional writer mapping differs from verified release"
         );
         journal.release.source_identity.validate()?;
         ensure!(
@@ -1404,17 +1670,7 @@ pub fn inspect_status(work_directory: &Path) -> Result<UpgradeInspection, Upgrad
     let installed_binary_sha256 = native_release::installed_binary(&journal.plan)
         .ok()
         .and_then(|path| snapshot::digest_file(&path).ok());
-    let installed_program = match installed_binary_sha256.as_deref() {
-        Some(value) if value == journal.original_binary_sha256 => "original",
-        Some(value) if value == journal.release.binary_sha256 => "target",
-        Some(_) => "unknown",
-        None => "unreadable",
-    };
-    let installed_program = if journal.native_backup.is_some() {
-        native_release::program_status(&journal).unwrap_or("unreadable")
-    } else {
-        installed_program
-    };
+    let installed_program = native_release::program_status(&journal).unwrap_or("unreadable");
     let persistent_state_verification = if !journal.backup_complete {
         "no-complete-backup"
     } else if verify_unchanged(&journal).is_ok() {
@@ -1422,12 +1678,10 @@ pub fn inspect_status(work_directory: &Path) -> Result<UpgradeInspection, Upgrad
     } else {
         "changed-or-unreadable"
     };
-    let maintenance_pending = fs::symlink_metadata(journal.plan.data_dir.join(PENDING)).is_ok();
     Ok(UpgradeInspection {
         journal,
         installed_program,
         installed_binary_sha256,
-        maintenance_pending,
         persistent_state_verification,
     })
 }
@@ -1442,23 +1696,25 @@ pub fn recover(
     control: &mut impl ServiceControl,
 ) -> Result<UpgradeJournal, UpgradeFailure> {
     let mut journal = inspect(work_directory)?;
-    let _release_upgrade = native_release::coordinate(&journal.plan).map_err(|_| {
+    let _release_upgrade = native_release::coordinate(&journal.plan, control.inherited_tool_lock()).map_err(|_| {
         failure(
             "MAINTENANCE_BUSY",
             "The release directory is in use by another maintenance process, or the directory is unsafe.",
             Some(work_directory),
         )
     })?;
+    if let Some(lock) = &_release_upgrade {
+        control.bind_tool_lock(lock.descriptor()).map_err(|_| {
+            failure(
+                "MAINTENANCE_BUSY",
+                "Cannot bind the installation tool lock.",
+                Some(work_directory),
+            )
+        })?;
+    }
     if journal.phase == UpgradePhase::RolledBack {
         return Ok(journal);
     }
-    let _instance_upgrade = coordinator_lock(&journal.plan.data_dir).map_err(|_| {
-        failure(
-            "MAINTENANCE_BUSY",
-            "Another maintenance process is operating on this data directory.",
-            Some(work_directory),
-        )
-    })?;
     if (journal.new_program_may_have_written || journal.recovered_program_may_have_written)
         && !allow_data_loss
     {
@@ -1467,9 +1723,6 @@ pub fn recover(
             "Runtime ownership has been transferred to the target program, which may have received new business writes. Restoring the old backup discards those writes; use --allow-data-loss only with explicit authorization.",
             Some(work_directory),
         ));
-    }
-    if journal.phase != UpgradePhase::Prechecked {
-        require_stopped(&journal.plan, control)?;
     }
     let work = PrivateStateDirectory::open(work_directory).map_err(|_| {
         failure(
@@ -1486,7 +1739,7 @@ pub fn recover(
         )
     })?;
     let result = (|| -> anyhow::Result<()> {
-        // Prechecked has no gate or resource changes; close its record without
+        // Prechecked has no resource changes; close its record without
         // changing a service that the operator may have subsequently started.
         if journal.phase == UpgradePhase::Prechecked {
             ensure!(
@@ -1494,20 +1747,61 @@ pub fn recover(
                     == journal.original_binary_sha256,
                 "installed binary differs from the precheck"
             );
+            execution::cleanup_precheck(&journal)?;
+            journal.payload_stage_seal = None;
             return transition(&mut journal, UpgradePhase::RolledBack);
         }
         transition(&mut journal, UpgradePhase::RecoveryMaintenanceIntent)?;
-        gate(&journal)?;
+        control.establish_startup_control(&mut journal)?;
+        control.stop(&mut journal)?;
+        control.verify_startup_control(&journal)?;
         ensure!(
             all_stopped(&journal.plan, control)?,
             "service remains active during recovery"
         );
         let state = PrivateStateDirectory::open_for_administration(&journal.plan.data_dir)?;
-        let maintenance = state.try_maintenance_lock()?;
         ensure!(
             all_stopped(&journal.plan, control)?,
             "service restarted during recovery maintenance acquisition"
         );
+        let paths = if journal.runtime_locks.is_empty() {
+            let config = control.configuration(
+                &native_release::installed_binary(&journal.plan)?,
+                &journal.plan,
+                journal.release.artifact.as_ref(),
+            )?;
+            journal.business_paths = serde_json::from_value(
+                config
+                    .get("business_paths")
+                    .context("configuration lacks business roots")?
+                    .clone(),
+            )?;
+            serde_json::from_value(
+                config
+                    .get("runtime_locks")
+                    .context("configuration lacks runtime locks")?
+                    .clone(),
+            )?
+        } else {
+            runtime_locks::declarations(&journal.runtime_locks)
+        };
+        let held = runtime_locks::acquire(
+            &journal.plan,
+            &paths,
+            &journal.business_paths,
+            &journal.runtime_locks,
+        )?;
+        journal.runtime_locks = held.iter().map(|lock| lock.authority.clone()).collect();
+        control.bind_instance_locks(
+            &held
+                .iter()
+                .map(|lock| {
+                    use std::os::fd::AsFd;
+                    (lock.authority.path.clone(), lock.file.as_fd())
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        save(&journal)?;
         let installed = snapshot::digest_file(&native_release::installed_binary(&journal.plan)?);
         ensure!(
             installed
@@ -1520,7 +1814,7 @@ pub fn recover(
         if journal.backup_complete {
             verify_backups(&journal)?;
             transition(&mut journal, UpgradePhase::RecoveryRestoring)?;
-            if journal.native_backup.is_some() && native_release::original_needs_repair(&journal)? {
+            if native_release::original_needs_repair(&journal)? {
                 journal
                     .native_backup
                     .as_mut()
@@ -1529,33 +1823,27 @@ pub fn recover(
                 save(&journal)?;
             }
             for (index, backup) in journal.backups.iter().enumerate() {
-                snapshot::restore(
+                runtime_locks::verify(&held)?;
+                snapshot::restore_preserving(
                     &work_directory.join(format!("resource-{index}")),
                     &backup.resource.path,
                     &backup.entries,
-                    backup.resource.path == journal.plan.data_dir,
-                    // The verified snapshot must fit the backup budget, but
-                    // current data may have grown since runtime handoff. Its
-                    // authorized replacement must not reuse that old budget.
                     u64::MAX,
                     &backup.ownership,
+                    journal.shared_paths.contains(&backup.resource.path),
+                    snapshot::Preserved {
+                        files: &runtime_locks::file_paths(&journal.runtime_locks),
+                        directories: &runtime_locks::directory_paths(&journal.runtime_locks),
+                    },
                 )?;
+                runtime_locks::verify(&held)?;
                 snapshot::restore_ownership(
                     &backup.resource.path,
                     &backup.entries,
                     &backup.ownership,
                 )?;
             }
-            if journal.native_backup.is_some() {
-                native_release::restore_original(&journal)?;
-            } else {
-                install(
-                    &work_directory.join("original-binary"),
-                    &journal.plan.installed_binary,
-                    &journal.original_binary_sha256,
-                    journal.original_binary_mode,
-                )?;
-            }
+            native_release::restore_original(&journal)?;
             verify_unchanged(&journal)?;
             let before_validation = inventory_current(&journal)?;
             let restored = control.validate(
@@ -1568,6 +1856,7 @@ pub fn recover(
                 "restored current structure differs from the original contract"
             );
             validate_coverage(&restored.state_paths, &journal.plan)?;
+            verify_unchanged(&journal)?;
             ensure!(
                 before_validation == inventory_current(&journal)?,
                 "restored current validator wrote protected state"
@@ -1584,12 +1873,19 @@ pub fn recover(
         state.verify_identity()?;
         journal.recovered_program_may_have_written = true;
         transition(&mut journal, UpgradePhase::RecoveryStartIntent)?;
-        clear_gate(&journal)?;
-        maintenance.release()?;
-        control.start(&journal.plan)?;
-        wait_ready(&journal, control, &journal.original_binary_sha256)?;
+        runtime_locks::verify(&held)?;
+        control.release_instance_locks();
+        drop(held);
+        control.release_startup_control(&mut journal)?;
+        let outcome = control.start_recovered(&journal)?;
+        journal.recovery_outcome = Some(outcome.into());
+        save(&journal)?;
+        if outcome == "restored-ready-required" {
+            wait_ready(&journal, control, &journal.original_binary_sha256)?;
+        }
         transition(&mut journal, UpgradePhase::RolledBack)
     })();
+    control.release_instance_locks();
     result.map_err(|_error| {
         failure(
             "RECOVERY_EXECUTION_FAILED",
@@ -1598,4 +1894,23 @@ pub fn recover(
         )
     })?;
     Ok(journal)
+}
+
+/// CLI observations coordinate the complete managed installation before reading state.
+pub fn inspect_coordinated(
+    work: &Path,
+    control: &mut impl ServiceControl,
+) -> anyhow::Result<UpgradeInspection> {
+    snapshot::require_path(work)?;
+    let upgrades = work.parent().context("operation parent missing")?;
+    let maintenance = upgrades.parent().context("maintenance parent missing")?;
+    ensure!(
+        upgrades.file_name() == Some(std::ffi::OsStr::new("upgrades"))
+            && maintenance.file_name() == Some(std::ffi::OsStr::new("maintenance")),
+        "operation is outside fixed maintenance scope"
+    );
+    let root = maintenance.parent().context("installation root missing")?;
+    let lock = native_release::coordinate_root(root, control.inherited_tool_lock())?;
+    control.bind_tool_lock(lock.descriptor())?;
+    Ok(inspect_status(work)?)
 }

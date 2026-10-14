@@ -1630,8 +1630,8 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xcsc"
-version = "1.0.4"
-source = "git+https://github.com/isarmg/xcsc.git?rev=9cff5bc1425072533fcb8984ee4820b1f6ab6a5c#9cff5bc1425072533fcb8984ee4820b1f6ab6a5c"
+version = "1.0.0"
+source = "git+https://github.com/isarmg/xcsc.git?rev=6fca4299f5c34a79db1c7bd4e889b418d2a58e2d#6fca4299f5c34a79db1c7bd4e889b418d2a58e2d"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "xssc"
-version = "1.0.3"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",

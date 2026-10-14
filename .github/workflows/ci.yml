@@ -71,7 +71,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: isarmg/xcsc
-          ref: 5641a33e991209eecdbbc91cffaa3be545875757
+          ref: 6fca4299f5c34a79db1c7bd4e889b418d2a58e2d
           path: xcsc-policy
           persist-credentials: false
       - name: Verify manifest, immutable dependencies and exact lock source
@@ -110,9 +110,6 @@ jobs:
           python3 scripts/stage-release-docs.py verify \
             --package-root "$RUNNER_TEMP/xssc-docs" --version "$version"
 
-      - name: Test signed product upgrade packaging
-        run: python3 -m unittest discover -s scripts/tests -v
-
       - name: Install Rust 1.99.0
         if: ${{ needs.scope.outputs.run_full != 'false' }}
         run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
@@ -145,4 +142,6 @@ jobs:
         if: ${{ needs.scope.outputs.run_full != 'false' }}
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
-        run: cargo test --locked --all-targets --all-features
+        run: |
+          cargo test --locked --all-targets --all-features --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/xssc-test-build.jsonl"
+          python3 scripts/run-root-tests.py "$RUNNER_TEMP/xssc-test-build.jsonl"

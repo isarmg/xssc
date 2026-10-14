@@ -2,52 +2,6 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
-fn coordinator_drop_unlocks_an_aliased_description_without_removing_its_inode() {
-    use std::os::unix::fs::MetadataExt;
-    let temporary = tempfile::tempdir().unwrap();
-    let data = temporary.path().join("data");
-    snapshot::private_directory(&data).unwrap();
-    let lock = coordinator_lock(&data).unwrap();
-    let alias = lock.file.file().try_clone().unwrap();
-    let path = data.join(snapshot::COORDINATOR);
-    let identity = fs::metadata(&path).unwrap().ino();
-    assert!(coordinator_lock(&data).is_err());
-    // Failed acquisition must not unlock the current owner.
-    assert!(coordinator_lock(&data).is_err());
-    drop(lock);
-    let next = coordinator_lock(&data).unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().ino(), identity);
-    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-    // Closing an alias to the previous description must not unlock this owner.
-    drop(alias);
-    assert!(coordinator_lock(&data).is_err());
-    drop(next);
-    assert!(coordinator_lock(&data).is_ok());
-}
-
-#[test]
-fn state_lock_verification_failure_unlocks_only_the_original_description() {
-    let temporary = tempfile::tempdir().unwrap();
-    let data = temporary.path().join("data");
-    snapshot::private_directory(&data).unwrap();
-    let directory = PrivateStateDirectory::open(&data).unwrap();
-    let file = directory.create_file(snapshot::COORDINATOR).unwrap();
-    let alias = file.file().try_clone().unwrap();
-    let original = data.join("original-coordinator");
-    fs::rename(data.join(snapshot::COORDINATOR), &original).unwrap();
-    directory.create_file(snapshot::COORDINATOR).unwrap();
-    assert!(StateLock::acquire(file).is_err());
-    let separately_opened = fs::File::open(original).unwrap();
-    rustix::fs::flock(
-        &separately_opened,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )
-    .unwrap();
-    assert!(coordinator_lock(&data).is_ok());
-    drop(alias);
-}
-
-#[test]
 fn restore_read_only_directories_preserves_contents_modes_and_ownership() {
     // A root process would hide the permission regression. Exercise the same
     // test as an ordinary user even when the suite is launched by root.
@@ -58,16 +12,32 @@ fn restore_read_only_directories_preserves_contents_modes_and_ownership() {
         let executable = temporary.path().join("nonroot-restore-test");
         fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        let output = std::process::Command::new(executable)
-            .args([
+        std::fs::File::open(&executable)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let mut command = std::process::Command::new(&executable);
+        command.args([
                 "--exact",
                 "upgrade::tests::restore_read_only_directories_preserves_contents_modes_and_ownership",
                 "--nocapture",
             ])
             .uid(65534)
             .gid(65534)
-            .output()
-            .unwrap();
+            ;
+        let mut retries = 0;
+        let output = loop {
+            match command.output() {
+                Ok(output) => break output,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && retries < 10 =>
+                {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("spawn nonroot restore fixture: {error}"),
+            }
+        };
         assert!(
             output.status.success(),
             "non-root restore failed: {}{}",
@@ -91,12 +61,12 @@ fn restore_read_only_directories_preserves_contents_modes_and_ownership() {
                 fs::set_permissions(root.join(relative), fs::Permissions::from_mode(mode)).unwrap();
             }
         }
+        fs::write(original.join("operator-file"), b"original operator file").unwrap();
         let entries = snapshot::inventory(&original, true, 4096, true).unwrap();
         let owners = snapshot::ownership(&original, &entries).unwrap();
         snapshot::snapshot(&original, &backup, &entries).unwrap();
-        let gate = target.join(snapshot::PENDING);
+        let gate = target.join("operator-file");
         fs::write(&gate, b"pending gate").unwrap();
-        let gate_inode = fs::metadata(&gate).unwrap().ino();
         let result = (|| -> anyhow::Result<()> {
             // Include an extra entry to verify replacement and repeat recovery
             // from an already restored read-only directory tree.
@@ -110,8 +80,7 @@ fn restore_read_only_directories_preserves_contents_modes_and_ownership() {
                     fs::read(target.join("nested/deeper/object"))?,
                     b"nested object"
                 );
-                assert_eq!(fs::metadata(&gate)?.ino(), gate_inode);
-                assert_eq!(fs::read(&gate)?, b"pending gate");
+                assert_eq!(fs::read(&gate)?, b"original operator file");
                 assert!(!target.join("obsolete").exists());
             }
             Ok(())
@@ -130,431 +99,1242 @@ struct Fixture {
     _directory: tempfile::TempDir,
     plan: UpgradePlan,
     release: UpgradeRelease,
-    private_key: PathBuf,
+    root: PathBuf,
+    target: PathBuf,
+    services: Vec<native_release::PackageService>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::product("xocs")
+    }
+    fn product(product: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let data = root.join("data");
-        snapshot::private_directory(&data).unwrap();
-        fs::write(data.join("config.json"), b"{\"current\":true}\n").unwrap();
+        let base = directory.path();
+        let root = base.join("installation");
+        let target = base.join("download");
+        for directory in [&root, &target] {
+            fs::create_dir_all(directory.join("bin")).unwrap();
+            fs::create_dir_all(directory.join("libexec")).unwrap();
+            fs::create_dir_all(directory.join("share/systemd")).unwrap();
+            for path in [
+                directory.clone(),
+                directory.join("bin"),
+                directory.join("libexec"),
+                directory.join("share"),
+                directory.join("share/systemd"),
+            ] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            snapshot::copy_regular(
+                Path::new("/usr/bin/true"),
+                &directory.join("libexec/setup"),
+                0o755,
+            )
+            .unwrap();
+            fs::write(
+                directory
+                    .join("share/systemd")
+                    .join(format!("{product}.service")),
+                b"checksummed systemd fixture",
+            )
+            .unwrap();
+        }
+        snapshot::copy_regular(
+            Path::new("/usr/bin/false"),
+            &root.join("bin").join(product),
+            0o755,
+        )
+        .unwrap();
+        snapshot::copy_regular(
+            Path::new("/usr/bin/true"),
+            &target.join("bin").join(product),
+            0o755,
+        )
+        .unwrap();
+        fs::write(
+            root.join("share/obsolete"),
+            b"obsolete checksummed resource",
+        )
+        .unwrap();
+        fs::write(
+            target.join("share/new-resource"),
+            b"new checksummed resource",
+        )
+        .unwrap();
+        for path in [
+            root.join("state"),
+            root.join("logs"),
+            root.join("config"),
+            root.join("maintenance"),
+            root.join("maintenance/upgrades"),
+        ] {
+            snapshot::private_directory(&path).unwrap();
+        }
+        let data = root.join("state");
+        let config = root.join("config/config.json");
+        fs::write(&config, b"{\"current\":true}\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(data.join(".state-instance.lock"), b"").unwrap();
+        fs::set_permissions(
+            data.join(".state-instance.lock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         fs::write(data.join("business.txt"), b"business-before-upgrade").unwrap();
         snapshot::private_directory(&data.join("nested")).unwrap();
         fs::write(data.join("nested/object"), b"object-before-upgrade").unwrap();
-        let private_key = root.join("signing.pem");
-        let public_key = root.join("public.pem");
-        run_bounded(
-            "/usr/bin/openssl",
-            &[
-                "genpkey".into(),
-                "-algorithm".into(),
-                "ED25519".into(),
-                "-out".into(),
-                private_key.to_string_lossy().into_owned(),
-            ],
-            10,
-        )
-        .unwrap();
-        run_bounded(
-            "/usr/bin/openssl",
-            &[
-                "pkey".into(),
-                "-in".into(),
-                private_key.to_string_lossy().into_owned(),
-                "-pubout".into(),
-                "-out".into(),
-                public_key.to_string_lossy().into_owned(),
-            ],
-            10,
-        )
-        .unwrap();
-        let der = run_bounded(
-            "/usr/bin/openssl",
-            &[
-                "pkey".into(),
-                "-pubin".into(),
-                "-in".into(),
-                public_key.to_string_lossy().into_owned(),
-                "-outform".into(),
-                "DER".into(),
-            ],
-            10,
-        )
-        .unwrap();
-        let installed = root.join("server");
-        let target = root.join("new-server");
-        snapshot::copy_regular(Path::new("/usr/bin/false"), &installed, 0o700).unwrap();
-        snapshot::copy_regular(Path::new("/usr/bin/true"), &target, 0o700).unwrap();
-        let schema =
-            SchemaIdentity::new("test-product", "database-current", 1, "a".repeat(64)).unwrap();
-        let release = UpgradeRelease {
-            manifest_version: 1,
-            source_identity: ReleaseIdentity {
-                product: "test-product".into(),
-                version: "1.0.0".into(),
-                source_revision: "d".repeat(40),
-                target: crate::FORMAL_RELEASE_TARGET.into(),
-                state_contract_sha256: "e".repeat(64),
-            },
-            identity: ReleaseIdentity {
-                product: "test-product".into(),
-                version: "2.0.0".into(),
-                source_revision: "b".repeat(40),
-                target: crate::FORMAL_RELEASE_TARGET.into(),
-                state_contract_sha256: "c".repeat(64),
-            },
-            binary_sha256: snapshot::digest_file(&target).unwrap(),
-            source_schema: schema.clone(),
-            target_schema: schema,
-            artifact: None,
-            additional_service_roles: Vec::new(),
-            resources: vec![ReleaseResource {
-                name: "data".into(),
-                kind: ResourceType::Directory,
-            }],
+        let schema = SchemaIdentity::new(product, "database-current", 1, "a".repeat(64)).unwrap();
+        let source = ReleaseIdentity {
+            product: product.into(),
+            version: "1.0.0".into(),
+            source_revision: "d".repeat(40),
+            target: crate::FORMAL_RELEASE_TARGET.into(),
+            state_contract_sha256: "e".repeat(64),
         };
+        let identity = ReleaseIdentity {
+            version: "2.0.0".into(),
+            source_revision: "b".repeat(40),
+            ..source.clone()
+        };
+        let services = vec![native_release::PackageService {
+            name: format!("{product}.service"),
+            path: format!("share/systemd/{product}.service").into(),
+            role: "server".into(),
+        }];
+        let resources = vec![
+            PersistentResource {
+                name: "config".into(),
+                path: config.clone(),
+                kind: ResourceType::File,
+            },
+            PersistentResource {
+                name: "data".into(),
+                path: data.clone(),
+                kind: ResourceType::Directory,
+            },
+            PersistentResource {
+                name: "logs".into(),
+                path: root.join("logs"),
+                kind: ResourceType::Directory,
+            },
+        ];
         let plan = UpgradePlan {
             plan_version: 1,
-            service: "test-product.service".into(),
+            service: format!("{product}.service"),
             additional_services: Vec::new(),
-            installed_binary: installed,
-            target_binary: target,
-            release_manifest: root.join("upgrade-release.json"),
-            release_signature: root.join("upgrade-release.sig"),
-            trusted_public_key: public_key,
-            trusted_public_key_sha256: digest_hex(Sha256::digest(der)),
-            config: data.join("config.json"),
-            data_dir: data.clone(),
-            resources: vec![PersistentResource {
-                name: "data".into(),
-                path: data,
-                kind: ResourceType::Directory,
-            }],
-            work_directory: root.join("upgrade"),
+            installed_binary: root.join("bin").join(product),
+            target_binary: target.join("bin").join(product),
+            release_manifest: target.join("share/package.json"),
+            release_checksum: target.join("share/package.sha256"),
+            config,
+            data_dir: data,
+            resources: resources.clone(),
+            work_directory: root
+                .join("maintenance/upgrades")
+                .join(Uuid::new_v4().to_string()),
             readiness_address: "127.0.0.1:12345".parse().unwrap(),
             timeout_seconds: 1,
             max_backup_bytes: 10_000_000,
-            native_release: None,
+            native_release: Some(NativeReleasePlan {
+                root: root.clone(),
+                source_manifest: root.join("share/package.json"),
+            }),
+        };
+        let release = UpgradeRelease {
+            manifest_version: 1,
+            source_identity: source.clone(),
+            identity,
+            binary_sha256: snapshot::digest_file(&plan.target_binary).unwrap(),
+            source_schema: schema.clone(),
+            target_schema: schema.clone(),
+            artifact: None,
+            resources: resources
+                .iter()
+                .map(|r| ReleaseResource {
+                    name: r.name.clone(),
+                    kind: r.kind,
+                })
+                .collect(),
+            additional_service_roles: Vec::new(),
         };
         let fixture = Self {
             _directory: directory,
             plan,
             release,
-            private_key,
+            root,
+            target,
+            services,
         };
-        fixture.sign();
+        fixture.package(&fixture.root, &source, &schema);
+        fixture.finalize();
         fixture
     }
-
-    fn sign(&self) {
-        fs::write(
-            &self.plan.release_manifest,
-            serde_json::to_vec_pretty(&self.release).unwrap(),
-        )
-        .unwrap();
-        run_bounded(
-            "/usr/bin/openssl",
-            &[
-                "pkeyutl".into(),
-                "-sign".into(),
-                "-inkey".into(),
-                self.private_key.to_string_lossy().into_owned(),
-                "-rawin".into(),
-                "-in".into(),
-                self.plan.release_manifest.to_string_lossy().into_owned(),
-                "-out".into(),
-                self.plan.release_signature.to_string_lossy().into_owned(),
-            ],
-            10,
-        )
-        .unwrap();
-    }
-
-    fn use_complete_release(&mut self) {
-        use std::os::unix::fs::symlink;
-        let base = self._directory.path();
-        let installation = base.join("install");
-        let source = installation.join("releases/1.0.0");
-        let target = base.join("download/install/releases/2.0.0");
-        for (root, binary, body) in [
-            (
-                &source,
-                &self.plan.installed_binary,
-                b"original-web".as_slice(),
-            ),
-            (&target, &self.plan.target_binary, b"target-web".as_slice()),
-        ] {
-            fs::create_dir_all(root.join("bin")).unwrap();
-            fs::create_dir_all(root.join("share")).unwrap();
-            snapshot::copy_regular(binary, &root.join("bin/server"), 0o555).unwrap();
-            fs::write(root.join("share/web"), body).unwrap();
-            fs::set_permissions(root.join("share/web"), fs::Permissions::from_mode(0o444)).unwrap();
-            for path in [root.clone(), root.join("bin"), root.join("share")] {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+    fn package(&self, root: &Path, identity: &ReleaseIdentity, schema: &SchemaIdentity) {
+        let mut files = Vec::new();
+        fn scan(root: &Path, path: &Path, files: &mut Vec<native_release::PayloadFile>) {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap();
+                if matches!(
+                    relative.to_str().unwrap(),
+                    "share/package.json" | "share/package.sha256"
+                ) {
+                    continue;
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    scan(root, &path, files);
+                } else {
+                    let mode =
+                        if relative.starts_with("bin") || relative == Path::new("libexec/setup") {
+                            0o755
+                        } else {
+                            0o644
+                        };
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                    files.push(native_release::PayloadFile {
+                        path: relative.to_path_buf(),
+                        mode: format!("{mode:04o}"),
+                        size: fs::metadata(&path).unwrap().len(),
+                        sha256: snapshot::digest_file(&path).unwrap(),
+                    });
+                }
             }
         }
-        fs::set_permissions(&installation, fs::Permissions::from_mode(0o755)).unwrap();
-        let current = installation.join("current");
-        symlink(&source, &current).unwrap();
-        self.plan.installed_binary = current.join("bin/server");
-        self.plan.target_binary = target.join("bin/server");
-        self.plan.native_release = Some(NativeReleasePlan {
-            current_link: current,
-            source_root: source,
-            install_root: installation.join("releases/2.0.0"),
-        });
-        let entries =
-            snapshot::inventory(&target, true, self.plan.max_backup_bytes, false).unwrap();
-        self.release.artifact = Some(ReleaseArtifact {
-            protocol: "immutable-release-root-v1".into(),
-            root_layout: "install/releases/2.0.0".into(),
-            entrypoint: "bin/server".into(),
-            tree_sha256: native_release::tree_digest(&entries).unwrap(),
-            diagnostic_release_root_env: None,
-        });
-        self.sign();
+        for name in ["bin", "libexec", "share"] {
+            scan(root, &root.join(name), &mut files);
+        }
+        files.sort_by_key(|f| f.path.clone());
+        let package = native_release::PackageManifest {
+            manifest_version: 1,
+            identity: identity.clone(),
+            schema_identity: schema.clone(),
+            server: format!("bin/{}", identity.product).into(),
+            setup: "libexec/setup".into(),
+            services: self.services.clone(),
+            files,
+        };
+        let manifest = root.join("share/package.json");
+        fs::write(&manifest, serde_json::to_vec(&package).unwrap()).unwrap();
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(
+            root.join("share/package.sha256"),
+            format!("{}\n", snapshot::digest_file(&manifest).unwrap()),
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.join("share/package.sha256"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
     }
-
+    fn finalize(&self) {
+        self.package(
+            &self.target,
+            &self.release.identity,
+            &self.release.target_schema,
+        );
+    }
+    fn delegate_state_when_administrator(&self) {
+        if rustix::process::geteuid().as_raw() != 0 {
+            return;
+        }
+        fs::set_permissions(self._directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let entries = snapshot::inventory(&self.plan.data_dir, true, 1024, true).unwrap();
+        for entry in entries {
+            let path = if entry.path.as_os_str().is_empty() {
+                self.plan.data_dir.clone()
+            } else {
+                self.plan.data_dir.join(entry.path)
+            };
+            let file = fs::File::open(path).unwrap();
+            rustix::fs::fchown(
+                &file,
+                Some(rustix::process::Uid::from_raw(65534)),
+                Some(rustix::process::Gid::from_raw(65534)),
+            )
+            .unwrap();
+        }
+    }
     fn control(&self) -> MockControl {
         MockControl {
             schema: self.release.source_schema.clone(),
-            current_identity: self.release.source_identity.clone(),
-            target_identity: self.release.identity.clone(),
-            identity_calls: 0,
             active: false,
             active_services: BTreeSet::new(),
             fail_start: false,
+            fail_stop: false,
+            fail_target_validation: false,
             mutate_validator: false,
             validate_calls: 0,
-            fail_target_validation: false,
-            uncovered_state: None,
-            delegated_probe: false,
-            delegated_probe_complete: false,
+            uncovered: None,
+            shared_paths: Vec::new(),
+            fail_precheck_identity: false,
         }
     }
 }
 
-#[test]
-#[ignore = "child entry point for the administrator identity test"]
-fn service_identity_probe() {
-    assert_eq!(rustix::process::geteuid().as_raw(), 65534);
-    assert_eq!(rustix::process::getegid().as_raw(), 65534);
-    assert!(rustix::process::getgroups().unwrap().is_empty());
-    let arguments: Vec<String> = std::env::args().collect();
-    let path = &arguments[arguments.iter().position(|arg| arg == "--skip").unwrap() + 1];
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-    let data = Path::new(value["data_dir"].as_str().unwrap());
-    assert!(
-        PrivateStateDirectory::open(data)
-            .unwrap()
-            .try_maintenance_lock()
-            .is_err()
-    );
-    let executable = std::env::current_exe().unwrap();
-    let program = executable.as_path();
-    assert_eq!(fs::metadata(program).unwrap().uid(), 0);
-    assert_eq!(fs::metadata(data.join(PENDING)).unwrap().uid(), 65534);
-    assert_eq!(
-        fs::read(
-            program
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("share/web")
+struct MockControl {
+    schema: SchemaIdentity,
+    active: bool,
+    active_services: BTreeSet<String>,
+    fail_start: bool,
+    fail_stop: bool,
+    fail_target_validation: bool,
+    mutate_validator: bool,
+    validate_calls: usize,
+    uncovered: Option<PathBuf>,
+    shared_paths: Vec<PathBuf>,
+    fail_precheck_identity: bool,
+}
+impl ServiceControl for MockControl {
+    fn verify_release_identity(
+        &mut self,
+        binary: &Path,
+        plan: &UpgradePlan,
+        _identity: &ReleaseIdentity,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !self.fail_precheck_identity || binary == plan.installed_binary,
+            "injected staged identity failure"
+        );
+        Ok(())
+    }
+    fn stop(&mut self, journal: &mut UpgradeJournal) -> anyhow::Result<()> {
+        let plan = &journal.plan;
+        ensure!(!self.fail_stop, "injected state-writer shutdown failure");
+        self.active = false;
+        self.active_services.remove(&plan.service);
+        for service in &plan.additional_services {
+            self.active_services.remove(&service.service);
+        }
+        Ok(())
+    }
+    fn is_stopped(&mut self, plan: &UpgradePlan) -> anyhow::Result<bool> {
+        Ok(!self.active && !self.active_services.contains(&plan.service))
+    }
+    fn start(&mut self, _plan: &UpgradePlan) -> anyhow::Result<()> {
+        ensure!(!self.fail_start, "injected start failure");
+        self.active = true;
+        Ok(())
+    }
+    fn configuration(
+        &mut self,
+        _binary: &Path,
+        plan: &UpgradePlan,
+        _artifact: Option<&ReleaseArtifact>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut paths = vec![
+            plan.config.clone(),
+            plan.data_dir.clone(),
+            installation_root(plan)?.join("logs"),
+        ];
+        if let Some(path) = &self.uncovered {
+            paths.push(path.clone());
+        }
+        paths.extend(self.shared_paths.clone());
+        Ok(
+            serde_json::json!({"root":installation_root(plan)?,"product":service_product(plan)?,"data_dir":plan.data_dir,"state_paths":paths,"shared_paths":self.shared_paths,"business_paths":self.shared_paths,"runtime_locks":[{"path":plan.data_dir.join(".state-instance.lock"),"kind":"file"}]}),
         )
-        .unwrap(),
-        b"target-web"
-    );
-    assert!(fs::OpenOptions::new().write(true).open(program).is_err());
-    assert!(fs::remove_file(value["current"].as_str().unwrap()).is_err());
+    }
+    fn validate(
+        &mut self,
+        _binary: &Path,
+        plan: &UpgradePlan,
+        _artifact: Option<&ReleaseArtifact>,
+    ) -> anyhow::Result<ValidatedState> {
+        self.validate_calls += 1;
+        if self.validate_calls == 2 {
+            ensure!(
+                !self.fail_target_validation,
+                "injected target validation failure"
+            );
+            if self.mutate_validator {
+                fs::write(
+                    plan.data_dir.join("business.txt"),
+                    b"unexpected-validator-write",
+                )?;
+            }
+        }
+        let mut state_paths = vec![
+            plan.config.clone(),
+            plan.data_dir.clone(),
+            installation_root(plan)?.join("logs"),
+        ];
+        state_paths.extend(self.shared_paths.clone());
+        Ok(ValidatedState {
+            schema_identity: self.schema.clone(),
+            state_paths,
+        })
+    }
+    fn ready(&mut self, _plan: &UpgradePlan, _hash: &str, _identity: &str) -> anyhow::Result<bool> {
+        Ok(self.active)
+    }
+}
+
+#[test]
+fn payload_snapshot_records_only_a_new_root_before_copying_contents() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    snapshot::private_directory(&source).unwrap();
+    fs::write(source.join("program"), b"original immutable bytes").unwrap();
+    let entries = snapshot::inventory(&source, true, 1024, false).unwrap();
+    let target = temporary.path().join("target");
+    let mut recorded = None;
     assert!(
-        PrivateStateDirectory::open(data)
-            .unwrap()
-            .try_instance_lock()
-            .is_err()
+        snapshot::snapshot_recorded(&source, &target, &entries, |path, metadata| {
+            assert_eq!(path, target);
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+            assert!(!path.join("program").exists());
+            recorded = Some((metadata.dev(), metadata.ino()));
+            anyhow::bail!("simulated durable journal failure");
+        })
+        .is_err()
+    );
+    let metadata = fs::symlink_metadata(&target).unwrap();
+    assert_eq!(recorded, Some((metadata.dev(), metadata.ino())));
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+    fs::write(target.join("administrator-note"), b"existing content").unwrap();
+    let mut called = false;
+    assert!(
+        snapshot::snapshot_recorded(&source, &target, &entries, |_, _| {
+            called = true;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(!called);
+    assert_eq!(
+        fs::read(target.join("administrator-note")).unwrap(),
+        b"existing content"
     );
 }
 
 #[test]
-fn administrator_upgrade_delegates_to_real_service_identity_and_restores_ownership() {
+fn precheck_cleanup_preserves_an_unrecorded_payload_directory() {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    control.fail_precheck_identity = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    let mut journal = inspect(&fixture.plan.work_directory).unwrap();
+    journal.phase = UpgradePhase::Prechecked;
+    journal.native_backup = None;
+    let stage = fixture.plan.work_directory.join("target-payload");
+    snapshot::private_directory(&stage).unwrap();
+    fs::write(stage.join("administrator-note"), b"unrecorded content").unwrap();
+    execution::cleanup_precheck(&journal).unwrap();
+    assert_eq!(
+        fs::read(stage.join("administrator-note")).unwrap(),
+        b"unrecorded content"
+    );
+}
+
+#[test]
+fn precheck_without_native_backup_recovers_only_its_recorded_payload_root() {
+    let fixture = Fixture::new();
+    let before = fs::read(fixture.plan.data_dir.join("business.txt")).unwrap();
+    let mut control = fixture.control();
+    control.fail_precheck_identity = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    let mut journal = inspect(&fixture.plan.work_directory).unwrap();
+    journal.phase = UpgradePhase::Prechecked;
+    journal.native_backup = None;
+    let stage = fixture.plan.work_directory.join("target-payload");
+    snapshot::private_directory(&stage).unwrap();
+    let parent = fs::symlink_metadata(&fixture.plan.work_directory).unwrap();
+    let directory = fs::symlink_metadata(&stage).unwrap();
+    journal.payload_stage_seal = Some(execution::StageAuthority {
+        root: stage.clone(),
+        parent_device: parent.dev(),
+        parent_inode: parent.ino(),
+        directory_device: directory.dev(),
+        directory_inode: directory.ino(),
+    });
+    save(&journal).unwrap();
+    assert!(
+        inspect(&fixture.plan.work_directory)
+            .unwrap()
+            .native_backup
+            .is_none()
+    );
+    control.active = true;
+    let recovered = recover(&fixture.plan.work_directory, false, &mut control).unwrap();
+    assert_eq!(recovered.phase, UpgradePhase::RolledBack);
+    assert!(recovered.payload_stage_seal.is_none());
+    assert!(!stage.exists());
+    assert!(control.active);
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn private_or_deleted_payload_precheck_is_recoverable_without_execution() {
+    for interruption in ["private-payload", "removed-payload"] {
+        let fixture = Fixture::new();
+        let before = fs::read(fixture.plan.data_dir.join("business.txt")).unwrap();
+        let mut control = fixture.control();
+        control.fail_precheck_identity = true;
+        apply(&fixture.plan, &mut control).unwrap_err();
+        let mut journal = inspect(&fixture.plan.work_directory).unwrap();
+        journal.phase = UpgradePhase::Prechecked;
+        journal.native_backup = None;
+        let stage = journal.plan.work_directory.join("target-payload");
+        if interruption == "private-payload" {
+            snapshot::private_directory(&stage).unwrap();
+            let parent = fs::symlink_metadata(&journal.plan.work_directory).unwrap();
+            let created = fs::symlink_metadata(&stage).unwrap();
+            execution::record_payload_stage(&mut journal, &stage, &created).unwrap();
+            assert_eq!(
+                journal.payload_stage_seal.as_ref().unwrap().parent_inode,
+                parent.ino()
+            );
+        } else {
+            native_release::seal(&mut journal).unwrap();
+            journal.native_backup = None;
+            save(&journal).unwrap();
+            fs::remove_dir_all(&stage).unwrap();
+        }
+        assert!(
+            inspect(&fixture.plan.work_directory).is_ok(),
+            "{interruption}"
+        );
+        control.active = true;
+        let recovered = recover(&fixture.plan.work_directory, false, &mut control).unwrap();
+        assert_eq!(recovered.phase, UpgradePhase::RolledBack);
+        assert!(recovered.payload_stage_seal.is_none());
+        assert!(recovered.work_directory_seal.is_some());
+        assert!(!stage.exists());
+        assert!(control.active);
+        assert_eq!(
+            fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn copied_journal_cannot_change_operation_and_noncanonical_ids_are_rejected() {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    control.fail_precheck_identity = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    let journal = inspect(&fixture.plan.work_directory).unwrap();
+    let work = fixture
+        .root
+        .join("maintenance/upgrades")
+        .join(Uuid::new_v4().to_string());
+    snapshot::private_directory(&work).unwrap();
+    let mut copied = journal.clone();
+    copied.plan.work_directory = work.clone();
+    save(&copied).unwrap();
+    assert_eq!(inspect(&work).unwrap_err().code, "RECOVERY_STATE_INVALID");
+    let original = fs::read(fixture.plan.work_directory.join(JOURNAL)).unwrap();
+    for operation in [
+        journal.operation_id.simple().to_string(),
+        journal.operation_id.urn().to_string(),
+    ] {
+        let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        value["operation_id"] = serde_json::Value::String(operation);
+        fs::write(
+            fixture.plan.work_directory.join(JOURNAL),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect(&fixture.plan.work_directory).unwrap_err().code,
+            "RECOVERY_STATE_INVALID"
+        );
+    }
+    fs::write(fixture.plan.work_directory.join(JOURNAL), original).unwrap();
+    assert!(inspect(&fixture.plan.work_directory).is_ok());
+}
+
+#[test]
+fn failed_precheck_removes_only_its_owned_stage_and_next_upgrade_succeeds() {
+    let mut fixture = Fixture::new();
+    fixture.delegate_state_when_administrator();
+    let before = fs::read(fixture.plan.data_dir.join("business.txt")).unwrap();
+    let unrelated = fixture.root.join("maintenance/administrator-note");
+    fs::write(&unrelated, b"unrelated administrator content").unwrap();
+    let _operation = Uuid::parse_str(
+        fixture
+            .plan
+            .work_directory
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut control = fixture.control();
+    control.fail_precheck_identity = true;
+    assert_eq!(
+        apply(&fixture.plan, &mut control).unwrap_err().code,
+        "UPGRADE_PRECONDITION_FAILED"
+    );
+    assert!(!fixture.plan.work_directory.join("target-payload").exists());
+    assert_eq!(
+        fs::read(&unrelated).unwrap(),
+        b"unrelated administrator content"
+    );
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        before
+    );
+    let completed = inspect(&fixture.plan.work_directory).unwrap();
+    assert_eq!(completed.phase, UpgradePhase::RolledBack);
+    assert!(completed.work_directory_seal.is_some());
+    assert!(completed.payload_stage_seal.is_none());
+    fs::remove_file(unrelated).unwrap();
+    fixture.plan.work_directory = fixture
+        .root
+        .join("maintenance/upgrades")
+        .join(Uuid::new_v4().to_string());
+    control.fail_precheck_identity = false;
+    assert_eq!(
+        apply(&fixture.plan, &mut control).unwrap().phase,
+        UpgradePhase::Ready
+    );
+}
+
+#[test]
+fn two_checksum_upgrades_preserve_runtime_writes_and_distinct_bound_work_directories() {
+    let mut fixture = Fixture::new();
+    fixture.delegate_state_when_administrator();
+    let mut first_control = fixture.control();
+    let first = apply(&fixture.plan, &mut first_control).unwrap();
+    assert_eq!(first.phase, UpgradePhase::Ready);
+    if let Some(seal) = &first.work_directory_seal {
+        assert!(seal.root.join("target-payload/libexec/setup").is_file());
+        execution::verify(&first).unwrap();
+    }
+    fs::write(
+        fixture.plan.data_dir.join("business.txt"),
+        b"runtime-write-between-upgrades",
+    )
+    .unwrap();
+    fixture.plan.work_directory = fixture
+        .root
+        .join("maintenance/upgrades")
+        .join(Uuid::new_v4().to_string());
+    fixture.release.source_identity = first.release.identity.clone();
+    fixture.release.identity.version = "3.0.0".into();
+    fixture.release.identity.source_revision = "c".repeat(40);
+    fs::write(
+        fixture.target.join("share/new-resource"),
+        b"third release resource",
+    )
+    .unwrap();
+    fixture.finalize();
+    let mut second_control = fixture.control();
+    let second = apply(&fixture.plan, &mut second_control).unwrap();
+    assert_eq!(second.phase, UpgradePhase::Ready);
+    assert_eq!(second.release.source_identity, first.release.identity);
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"runtime-write-between-upgrades"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("share/new-resource")).unwrap(),
+        b"third release resource"
+    );
+    execution::verify(&first).unwrap();
+    execution::verify(&second).unwrap();
+    if rustix::process::geteuid().as_raw() == 0 {
+        assert!(first.work_directory_seal.is_some());
+        assert!(second.work_directory_seal.is_some());
+        assert_ne!(
+            first.work_directory_seal.unwrap().root,
+            second.work_directory_seal.unwrap().root
+        );
+    }
+}
+
+#[test]
+fn checksum_fixed_root_upgrade_preserves_state_and_removes_obsolete_payload() {
+    let fixture = Fixture::new();
+    let before = fs::read(&fixture.plan.config).unwrap();
+    let mut control = fixture.control();
+    let result = apply(&fixture.plan, &mut control).unwrap();
+    assert_eq!(result.phase, UpgradePhase::Ready);
+    assert!(result.backup_complete && result.new_program_may_have_written);
+    assert_eq!(
+        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
+        fixture.release.binary_sha256
+    );
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"business-before-upgrade"
+    );
+    assert_eq!(fs::read(&fixture.plan.config).unwrap(), before);
+    assert!(!fixture.root.join("share/obsolete").exists());
+    assert_eq!(
+        fs::read(fixture.root.join("share/new-resource")).unwrap(),
+        b"new checksummed resource"
+    );
+    assert!(!fixture.root.join("current").exists());
+    assert!(!fixture.root.join("releases").exists());
+    assert_eq!(
+        inspect(&fixture.plan.work_directory).unwrap().phase,
+        UpgradePhase::Ready
+    );
+}
+
+#[test]
+fn untrusted_target_or_source_is_rejected_before_maintenance() {
+    for source in [false, true] {
+        let fixture = Fixture::new();
+        let checksum = if source {
+            fixture.root.join("share/package.sha256")
+        } else {
+            fixture.plan.release_checksum.clone()
+        };
+        fs::write(checksum, [0u8; 64]).unwrap();
+        let mut control = fixture.control();
+        assert_eq!(
+            apply(&fixture.plan, &mut control).unwrap_err().code,
+            "ARTIFACT_UNTRUSTED"
+        );
+        assert!(!fixture.plan.work_directory.exists());
+        assert!(!control.active);
+    }
+}
+
+#[test]
+fn complete_payload_bytes_modes_and_platform_are_checked() {
+    for mutation in ["bytes", "mode", "platform", "extra"] {
+        let mut fixture = Fixture::new();
+        match mutation {
+            "bytes" => fs::write(fixture.target.join("share/new-resource"), b"tampered").unwrap(),
+            "mode" => fs::set_permissions(
+                fixture.target.join("libexec/setup"),
+                fs::Permissions::from_mode(0o777),
+            )
+            .unwrap(),
+            "platform" => {
+                fixture.release.identity.target = "aarch64-unknown-linux-gnu".into();
+                fixture.finalize();
+            }
+            _ => fs::write(
+                fixture.target.join("share/undeclared"),
+                b"undeclared resource",
+            )
+            .unwrap(),
+        }
+        assert!(apply(&fixture.plan, &mut fixture.control()).is_err());
+    }
+}
+
+#[test]
+fn legacy_manifest_and_selector_plan_are_not_accepted() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.plan.release_manifest,
+        serde_json::to_vec(&fixture.release).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &fixture.plan.release_checksum,
+        format!(
+            "{}\n",
+            snapshot::digest_file(&fixture.plan.release_manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    assert!(verify_release(&fixture.plan).is_err());
+    assert!(serde_json::from_value::<NativeReleasePlan>(serde_json::json!({"current_link":"/opt/project/current","source_root":"/opt/project/releases/1","install_root":"/opt/project/releases/2"})).is_err());
+}
+
+#[test]
+fn validation_failure_restores_complete_payload_and_persistent_group() {
+    let fixture = Fixture::new();
+    let original = snapshot::digest_file(&fixture.plan.installed_binary).unwrap();
+    let mut control = fixture.control();
+    control.fail_target_validation = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    assert!(
+        inspect(&fixture.plan.work_directory)
+            .unwrap()
+            .backup_complete
+    );
+    let result = recover(&fixture.plan.work_directory, false, &mut control).unwrap();
+    assert_eq!(result.phase, UpgradePhase::RolledBack);
+    assert!(control.active);
+    assert_eq!(
+        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
+        original
+    );
+    assert!(fixture.root.join("share/obsolete").is_file());
+    assert!(!fixture.root.join("share/new-resource").exists());
+}
+
+#[test]
+fn read_only_validator_side_effects_are_detected_and_restored() {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    control.mutate_validator = true;
+    assert_eq!(
+        apply(&fixture.plan, &mut control).unwrap_err().code,
+        "UPGRADE_STATE_VALIDATION_FAILED"
+    );
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"unexpected-validator-write"
+    );
+    recover(&fixture.plan.work_directory, false, &mut control).unwrap();
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"business-before-upgrade"
+    );
+}
+
+#[test]
+fn startup_failure_protects_new_writes_until_explicit_recovery_authorization() {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    control.fail_start = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    assert_eq!(
+        inspect(&fixture.plan.work_directory).unwrap().phase,
+        UpgradePhase::StartIntent
+    );
+    fs::write(
+        fixture.plan.data_dir.join("business.txt"),
+        b"new-business-write",
+    )
+    .unwrap();
+    assert_eq!(
+        recover(&fixture.plan.work_directory, false, &mut control)
+            .unwrap_err()
+            .code,
+        "RECOVERY_AUTHORIZATION_REQUIRED"
+    );
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"new-business-write"
+    );
+    control.fail_start = false;
+    control.active = false;
+    recover(&fixture.plan.work_directory, true, &mut control).unwrap();
+    assert_eq!(
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"business-before-upgrade"
+    );
+}
+
+#[test]
+fn recovery_restart_failure_also_preserves_post_start_write_authority() {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    control.fail_target_validation = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    control.fail_start = true;
+    recover(&fixture.plan.work_directory, false, &mut control).unwrap_err();
+    assert_eq!(
+        inspect(&fixture.plan.work_directory).unwrap().phase,
+        UpgradePhase::RecoveryStartIntent
+    );
+    assert_eq!(
+        recover(&fixture.plan.work_directory, false, &mut control)
+            .unwrap_err()
+            .code,
+        "RECOVERY_AUTHORIZATION_REQUIRED"
+    );
+}
+
+#[test]
+fn undeclared_or_broadened_resource_is_refused_before_backup() {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    control.uncovered = Some(fixture._directory.path().join("external-media"));
+    assert_eq!(
+        apply(&fixture.plan, &mut control).unwrap_err().code,
+        "UPGRADE_RESOURCE_COVERAGE_FAILED"
+    );
+    assert!(
+        !inspect(&fixture.plan.work_directory)
+            .unwrap()
+            .backup_complete
+    );
+    assert!(!fixture.plan.work_directory.join("resource-0").exists());
+    let mut plan = fixture.plan.clone();
+    plan.resources.push(PersistentResource {
+        name: "unrelated".into(),
+        path: fixture._directory.path().to_path_buf(),
+        kind: ResourceType::Directory,
+    });
+    assert!(validate_plan(&plan).is_err());
+}
+
+#[test]
+fn writer_shutdown_failure_and_tool_lock_prevent_snapshot_or_switch() {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    control.active = true;
+    control.fail_stop = true;
+    assert_eq!(
+        apply(&fixture.plan, &mut control).unwrap_err().code,
+        "UPGRADE_EXECUTION_FAILED"
+    );
+    assert!(!fixture.plan.work_directory.join("resource-0").exists());
+    assert_eq!(
+        inspect(&fixture.plan.work_directory).unwrap().phase,
+        UpgradePhase::MaintenanceIntent
+    );
+    control.active = false;
+    control.fail_stop = false;
     if rustix::process::geteuid().as_raw() != 0 {
         return;
     }
-    let mut fixture = Fixture::new();
-    fixture.plan.max_backup_bytes = 512 * 1024 * 1024;
-    fs::set_permissions(&fixture.plan.config, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::set_permissions(fixture._directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    fixture.use_complete_release();
-    let native = fixture.plan.native_release.clone().unwrap();
-    fs::remove_file(&fixture.plan.target_binary).unwrap();
-    snapshot::copy_regular(
-        &std::env::current_exe().unwrap(),
-        &fixture.plan.target_binary,
-        0o555,
-    )
-    .unwrap();
-    fixture.release.binary_sha256 = snapshot::digest_file(&fixture.plan.target_binary).unwrap();
-    fixture.release.artifact.as_mut().unwrap().tree_sha256 = native_release::tree_digest(
-        &snapshot::inventory(
-            fixture
-                .plan
-                .target_binary
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap(),
-            true,
-            fixture.plan.max_backup_bytes,
-            false,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    fixture.sign();
-    fs::write(
-        fixture.plan.data_dir.join("probe.json"),
-        serde_json::to_vec(
-            &serde_json::json!({"data_dir":fixture.plan.data_dir,"current":native.current_link}),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    fs::set_permissions(
-        fixture.plan.data_dir.join("probe.json"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    let entries = snapshot::inventory(
-        &fixture.plan.data_dir,
-        true,
-        fixture.plan.max_backup_bytes,
-        false,
-    )
-    .unwrap();
-    let owners: Vec<_> = entries
-        .iter()
-        .map(|entry| snapshot::Ownership {
-            path: entry.path.clone(),
-            uid: 65534,
-            gid: 65534,
-        })
-        .collect();
-    snapshot::restore_ownership(&fixture.plan.data_dir, &entries, &owners).unwrap();
-    assert!(PrivateStateDirectory::open(&fixture.plan.data_dir).is_err());
+    let _operation = native_release::coordinate(&fixture.plan, None).unwrap();
+    assert!(apply(&fixture.plan, &mut control).is_err());
+    assert!(!fixture.plan.work_directory.join("resource-0").exists());
+}
+
+#[test]
+fn corrupt_complete_backup_cannot_overwrite_current_state() {
+    let fixture = Fixture::new();
     let mut control = fixture.control();
-    control.delegated_probe = true;
-    let journal = apply(&fixture.plan, &mut control).unwrap();
-    assert_eq!(journal.phase, UpgradePhase::Ready);
-    assert!(journal.execution_seal.is_some());
-    assert!(control.delegated_probe_complete);
+    control.fail_target_validation = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    fs::write(
+        fixture.plan.work_directory.join("resource-1/business.txt"),
+        b"corrupt",
+    )
+    .unwrap();
     assert_eq!(
-        fs::metadata(fixture.plan.data_dir.join(".state-maintenance.lock"))
-            .unwrap()
-            .uid(),
-        65534
-    );
-    assert_eq!(fs::metadata(&native.current_link).unwrap().uid(), 0);
-    assert_eq!(
-        fs::metadata(&fixture.plan.work_directory).unwrap().mode() & 0o777,
-        0o700
-    );
-    control.delegated_probe = false;
-    control.active = false;
-    assert_eq!(
-        recover(&fixture.plan.work_directory, true, &mut control)
-            .unwrap()
-            .phase,
-        UpgradePhase::RolledBack
+        recover(&fixture.plan.work_directory, false, &mut control)
+            .unwrap_err()
+            .code,
+        "RECOVERY_STATE_INVALID"
     );
     assert_eq!(
-        snapshot::inventory(
-            &fixture.plan.data_dir,
-            true,
-            fixture.plan.max_backup_bytes,
-            true
-        )
-        .unwrap(),
-        entries
-    );
-    assert_eq!(
-        snapshot::ownership(&fixture.plan.data_dir, &entries).unwrap(),
-        owners
-    );
-    assert_eq!(
-        fs::read_link(native.current_link).unwrap(),
-        native.source_root
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"business-before-upgrade"
     );
 }
 
 #[test]
-fn packaging_python_and_rust_bind_the_complete_tree_with_product_modes() {
+fn different_current_schema_is_rejected_without_conversion() {
     let mut fixture = Fixture::new();
-    fixture.use_complete_release();
-    let root = fixture
-        .plan
-        .target_binary
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    for path in [root.to_owned(), root.join("bin"), root.join("share")] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    fs::set_permissions(root.join("bin/server"), fs::Permissions::from_mode(0o755)).unwrap();
-    fs::set_permissions(root.join("share/web"), fs::Permissions::from_mode(0o644)).unwrap();
-    let identity = fixture._directory.path().join("identity.json");
-    let definition = fixture._directory.path().join("definition.json");
-    fs::write(
-        &identity,
-        serde_json::to_vec(&fixture.release.identity).unwrap(),
-    )
-    .unwrap();
-    let mut artifact = serde_json::to_value(fixture.release.artifact.as_ref().unwrap()).unwrap();
-    artifact.as_object_mut().unwrap().remove("tree_sha256");
-    fs::write(&definition, serde_json::to_vec(&serde_json::json!({
-        "source_identity":fixture.release.source_identity, "source_schema":fixture.release.source_schema, "target_schema":fixture.release.target_schema,
-        "resources":fixture.release.resources, "artifact":artifact,
-    })).unwrap()).unwrap();
-    fs::set_permissions(&fixture.private_key, fs::Permissions::from_mode(0o600)).unwrap();
-    let output = fixture._directory.path().join("signed-output");
-    run_bounded(
-        "/usr/bin/python3",
-        &[
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("scripts/stage-upgrade-release.py")
-                .to_string_lossy()
-                .into_owned(),
-            "--binary".into(),
-            fixture.plan.target_binary.to_string_lossy().into_owned(),
-            "--release-root".into(),
-            root.to_string_lossy().into_owned(),
-            "--identity".into(),
-            identity.to_string_lossy().into_owned(),
-            "--definition".into(),
-            definition.to_string_lossy().into_owned(),
-            "--private-key".into(),
-            fixture.private_key.to_string_lossy().into_owned(),
-            "--trusted-public-key".into(),
-            fixture
-                .plan
-                .trusted_public_key
-                .to_string_lossy()
-                .into_owned(),
-            "--output".into(),
-            output.to_string_lossy().into_owned(),
-        ],
-        20,
-    )
-    .unwrap();
-    fixture.plan.release_manifest = output.join("upgrade-release.json");
-    fixture.plan.release_signature = output.join("upgrade-release.sig");
+    fixture.release.target_schema.schema_revision = 2;
+    fixture.finalize();
+    let mut control = fixture.control();
+    assert!(apply(&fixture.plan, &mut control).is_err());
+    assert!(!control.active);
     assert_eq!(
-        apply(&fixture.plan, &mut fixture.control()).unwrap().phase,
-        UpgradePhase::Ready
+        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
+        b"business-before-upgrade"
     );
+}
+
+#[test]
+fn declared_shared_business_root_preserves_mixed_owners_and_group_modes_through_recovery() {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+    let mut fixture = Fixture::product("xczs");
+    let shared = fixture._directory.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::write(shared.join("document"), b"shared original").unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+    fs::set_permissions(shared.join("document"), fs::Permissions::from_mode(0o664)).unwrap();
+    for (path, uid, gid) in [
+        (&shared, 65534, 65534),
+        (&shared.join("document"), 65533, 65533),
+    ] {
+        let file = fs::File::open(path).unwrap();
+        rustix::fs::fchown(
+            &file,
+            Some(rustix::process::Uid::from_raw(uid)),
+            Some(rustix::process::Gid::from_raw(gid)),
+        )
+        .unwrap();
+    }
+    set_posix_acl(
+        &shared,
+        "system.posix_acl_access",
+        &posix_acl(7, 7, 5, 7, 5),
+    );
+    set_posix_acl(
+        &shared,
+        "system.posix_acl_default",
+        &posix_acl(7, 7, 5, 7, 5),
+    );
+    set_posix_acl(
+        &shared.join("document"),
+        "system.posix_acl_access",
+        &posix_acl(6, 6, 4, 6, 4),
+    );
+    set_mtime(&shared, 1_580_000_001, 123_456_789);
+    set_mtime(&shared.join("document"), 1_580_000_002, 987_654_321);
+    let entries = snapshot::inventory_shared(&shared, true, 1024).unwrap();
+    let ownership = snapshot::ownership(&shared, &entries).unwrap();
+    fixture.plan.resources.push(PersistentResource {
+        name: "files".into(),
+        path: shared.clone(),
+        kind: ResourceType::Directory,
+    });
+    let mut control = fixture.control();
+    control.shared_paths = vec![shared.clone()];
+    let journal = apply(&fixture.plan, &mut control).unwrap();
+    assert_eq!(journal.shared_paths, vec![shared.clone()]);
+    assert_eq!(
+        snapshot::inventory_shared(&shared, true, 1024).unwrap(),
+        entries
+    );
+    assert_eq!(snapshot::ownership(&shared, &entries).unwrap(), ownership);
+    fs::write(shared.join("document"), b"new shared write").unwrap();
+    control.active = false;
+    assert_eq!(
+        recover(&fixture.plan.work_directory, false, &mut control)
+            .unwrap_err()
+            .code,
+        "RECOVERY_AUTHORIZATION_REQUIRED"
+    );
+    recover(&fixture.plan.work_directory, true, &mut control).unwrap();
+    assert_eq!(
+        snapshot::inventory_shared(&shared, true, 1024).unwrap(),
+        entries
+    );
+    assert_eq!(snapshot::ownership(&shared, &entries).unwrap(), ownership);
+}
+
+fn posix_acl(owner: u16, named_user: u16, group: u16, mask: u16, other: u16) -> Vec<u8> {
+    let mut bytes = 2u32.to_le_bytes().to_vec();
+    for (tag, permission, id) in [
+        (1u16, owner, u32::MAX),
+        (2, named_user, 65534),
+        (4, group, u32::MAX),
+        (16, mask, u32::MAX),
+        (32, other, u32::MAX),
+    ] {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(permission.to_le_bytes());
+        bytes.extend(id.to_le_bytes());
+    }
+    bytes
+}
+
+fn set_posix_acl(path: &Path, name: &str, bytes: &[u8]) {
+    let file = fs::File::open(path).unwrap();
+    rustix::fs::fsetxattr(&file, name, bytes, rustix::fs::XattrFlags::empty()).unwrap();
+}
+
+fn set_mtime(path: &Path, seconds: i64, nanoseconds: i64) {
+    let file = fs::File::open(path).unwrap();
+    rustix::fs::futimens(
+        &file,
+        &rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_OMIT,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: seconds,
+                tv_nsec: nanoseconds,
+            },
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn interrupted_shared_restore_preserves_nested_acls_and_clears_inherited_absence() {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let shared = directory.path().join("shared");
+    let backup = directory.path().join("backup");
+    for relative in ["", "nested", "plain"] {
+        fs::create_dir(shared.join(relative)).unwrap();
+        fs::set_permissions(shared.join(relative), fs::Permissions::from_mode(0o775)).unwrap();
+    }
+    fs::write(shared.join("nested/object"), b"ACL protected object").unwrap();
+    fs::write(shared.join("plain/last-object"), b"plain object").unwrap();
+    fs::set_permissions(
+        shared.join("nested/object"),
+        fs::Permissions::from_mode(0o660),
+    )
+    .unwrap();
+    fs::set_permissions(
+        shared.join("plain/last-object"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    for relative in ["", "nested", "nested/object"] {
+        let file = fs::File::open(shared.join(relative)).unwrap();
+        rustix::fs::fchown(
+            &file,
+            Some(rustix::process::Uid::from_raw(65533)),
+            Some(rustix::process::Gid::from_raw(65533)),
+        )
+        .unwrap();
+    }
+    let root_acl = posix_acl(7, 7, 5, 7, 5);
+    let nested_acl = posix_acl(7, 7, 0, 7, 0);
+    set_posix_acl(&shared, "system.posix_acl_access", &root_acl);
+    set_posix_acl(&shared, "system.posix_acl_default", &root_acl);
+    set_posix_acl(
+        &shared.join("nested"),
+        "system.posix_acl_access",
+        &nested_acl,
+    );
+    set_posix_acl(
+        &shared.join("nested"),
+        "system.posix_acl_default",
+        &nested_acl,
+    );
+    set_posix_acl(
+        &shared.join("nested/object"),
+        "system.posix_acl_access",
+        &posix_acl(6, 6, 0, 6, 0),
+    );
+    for (index, relative) in ["", "nested", "nested/object", "plain", "plain/last-object"]
+        .into_iter()
+        .enumerate()
+    {
+        set_mtime(
+            &shared.join(relative),
+            1_580_000_010 + index as i64,
+            123_456_789 + index as i64,
+        );
+    }
+    let entries = snapshot::inventory_shared(&shared, true, 4096).unwrap();
+    let owners = snapshot::ownership(&shared, &entries).unwrap();
+    assert!(owners.iter().any(|owner| !owner.access_acl.is_empty()));
+    assert!(owners.iter().any(|owner| !owner.default_acl.is_empty()));
+    assert!(
+        owners
+            .iter()
+            .find(|owner| owner.path == Path::new("plain"))
+            .unwrap()
+            .access_acl
+            .is_empty()
+    );
+    snapshot::snapshot(&shared, &backup, &entries).unwrap();
+    // A missing later copy deterministically interrupts reconstruction after
+    // rebuilding an ACL-bearing subtree. Recovery must accept that partial
+    // tree and remove access/default ACLs inherited by the originally plain one.
+    let held = directory.path().join("held-backup-object");
+    fs::rename(backup.join("plain/last-object"), &held).unwrap();
+    fs::write(shared.join("obsolete"), b"discard").unwrap();
+    assert!(snapshot::restore_shared(&backup, &shared, &entries, 4096, &owners).is_err());
+    assert!(shared.join("nested/object").exists());
+    assert!(!shared.join("plain/last-object").exists());
+    fs::rename(&held, backup.join("plain/last-object")).unwrap();
+    for _ in 0..2 {
+        snapshot::restore_shared(&backup, &shared, &entries, 4096, &owners).unwrap();
+        assert_eq!(
+            snapshot::inventory_shared(&shared, true, 4096).unwrap(),
+            entries
+        );
+        assert_eq!(snapshot::ownership(&shared, &entries).unwrap(), owners);
+    }
+    let output = std::process::Command::new("/usr/bin/python3")
+        .args(["-I", "-B", "-c", "import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.read_bytes()==b'ACL protected object'; p.write_bytes(b'UID ACL write'); q=p.parent/'new-object'; q.write_bytes(b'default ACL write')"])
+        .arg(shared.join("nested/object"))
+        .uid(65534).gid(65534).output().unwrap();
+    assert!(
+        output.status.success(),
+        "restored UID/default ACL access failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let new = shared.join("nested/new-object");
+    let new_entries = snapshot::inventory_shared(&new, false, 4096).unwrap();
+    assert!(
+        !snapshot::ownership(&new, &new_entries).unwrap()[0]
+            .access_acl
+            .is_empty()
+    );
+}
+
+#[test]
+fn invalid_acl_metadata_is_rejected_before_replacing_shared_data() {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let shared = directory.path().join("shared");
+    let backup = directory.path().join("backup");
+    fs::create_dir(&shared).unwrap();
+    fs::write(shared.join("object"), b"original").unwrap();
+    let entries = snapshot::inventory_shared(&shared, true, 1024).unwrap();
+    let owners = snapshot::ownership(&shared, &entries).unwrap();
+    snapshot::snapshot(&shared, &backup, &entries).unwrap();
+    let mut duplicated_user = posix_acl(7, 7, 5, 7, 5);
+    let duplicate = duplicated_user[12..20].to_vec();
+    duplicated_user.splice(20..20, duplicate);
+    for invalid in [
+        vec![0; 65537],
+        vec![1, 2, 3, 4],
+        posix_acl(8, 7, 5, 7, 5),
+        duplicated_user,
+        posix_acl(7, 7, 5, 7, 5),
+    ] {
+        let mut corrupted = owners.clone();
+        corrupted[0].access_acl = invalid;
+        fs::write(shared.join("object"), b"current data").unwrap();
+        assert!(snapshot::restore_shared(&backup, &shared, &entries, 1024, &corrupted).is_err());
+        assert_eq!(fs::read(shared.join("object")).unwrap(), b"current data");
+    }
+    let file_index = entries.iter().position(|entry| !entry.directory).unwrap();
+    let mut corrupted = owners.clone();
+    corrupted[file_index].default_acl = posix_acl(7, 7, 5, 7, 5);
+    assert!(snapshot::restore_shared(&backup, &shared, &entries, 1024, &corrupted).is_err());
+    assert_eq!(fs::read(shared.join("object")).unwrap(), b"current data");
+    let mut value = serde_json::to_value(&owners[0]).unwrap();
+    value.as_object_mut().unwrap().remove("access_acl");
+    assert!(serde_json::from_value::<snapshot::Ownership>(value).is_err());
+    let mut corrupted = owners.clone();
+    corrupted[0].mtime_nanoseconds = 1_000_000_000;
+    assert!(snapshot::restore_shared(&backup, &shared, &entries, 1024, &corrupted).is_err());
+    assert_eq!(fs::read(shared.join("object")).unwrap(), b"current data");
+}
+
+#[test]
+fn shared_permissions_cannot_relax_private_state_or_accept_aliases() {
+    let fixture = Fixture::product("xczs");
+    assert!(
+        validate_shared_policy(
+            std::slice::from_ref(&fixture.plan.data_dir),
+            &fixture.plan,
+            "xczs"
+        )
+        .is_err()
+    );
+    assert!(
+        validate_shared_policy(
+            &[fixture.plan.config.parent().unwrap().to_path_buf()],
+            &fixture.plan,
+            "xczs"
+        )
+        .is_err()
+    );
+    let shared = fixture._directory.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::write(shared.join("file"), b"business").unwrap();
+    os_symlink(Path::new("/etc/passwd"), &shared.join("alias"));
+    assert!(snapshot::inventory_shared(&shared, true, 1024).is_err());
+    fs::remove_file(shared.join("alias")).unwrap();
+    os_link(&shared.join("file"), &shared.join("alias"));
+    assert!(snapshot::inventory_shared(&shared, true, 1024).is_err());
+}
+
+fn os_symlink(source: &Path, target: &Path) {
+    std::os::unix::fs::symlink(source, target).unwrap();
+}
+fn os_link(source: &Path, target: &Path) {
+    fs::hard_link(source, target).unwrap();
 }
 
 #[test]
@@ -582,316 +1362,6 @@ fn maintenance_capture_bounds_both_pipes_and_reaps_limit_or_timeout_children() {
         } else {
             "timed out"
         }));
-    }
-}
-
-#[test]
-fn release_paths_reject_lexical_aliases_and_dangling_selectors() {
-    let mut fixture = Fixture::new();
-    fixture.use_complete_release();
-    let original = fixture.plan.clone();
-    fixture.plan.target_binary = PathBuf::from(format!(
-        "{}/./server",
-        original.target_binary.parent().unwrap().display()
-    ));
-    assert!(validate_plan(&fixture.plan).is_err());
-    fixture.plan = original;
-    let native = fixture.plan.native_release.as_ref().unwrap();
-    fs::remove_file(&native.current_link).unwrap();
-    std::os::unix::fs::symlink(
-        format!("{}/../1.0.0", native.source_root.display()),
-        &native.current_link,
-    )
-    .unwrap();
-    assert!(native_release::installed_binary(&fixture.plan).is_err());
-    fs::remove_file(&native.current_link).unwrap();
-    std::os::unix::fs::symlink(&native.source_root, &native.current_link).unwrap();
-    std::os::unix::fs::symlink("missing", &native.install_root).unwrap();
-    assert!(apply(&fixture.plan, &mut fixture.control()).is_err());
-    assert!(!fixture.plan.data_dir.join(PENDING).exists());
-}
-
-#[test]
-fn complete_release_switches_one_selector_and_restores_original_root_and_state() {
-    let mut fixture = Fixture::new();
-    fixture.use_complete_release();
-    let native = fixture.plan.native_release.clone().unwrap();
-    let original = snapshot::inventory(
-        &native.source_root,
-        true,
-        fixture.plan.max_backup_bytes,
-        false,
-    )
-    .unwrap();
-    let mut control = fixture.control();
-    let applied = apply(&fixture.plan, &mut control).unwrap();
-    assert_eq!(applied.phase, UpgradePhase::Ready);
-    assert_eq!(
-        fs::read_link(&native.current_link).unwrap(),
-        native.install_root
-    );
-    assert_eq!(
-        fs::read(native.install_root.join("share/web")).unwrap(),
-        b"target-web"
-    );
-    assert_eq!(
-        snapshot::inventory(
-            &native.source_root,
-            true,
-            fixture.plan.max_backup_bytes,
-            false
-        )
-        .unwrap(),
-        original
-    );
-    assert_eq!(
-        inspect_status(&fixture.plan.work_directory)
-            .unwrap()
-            .installed_program,
-        "target"
-    );
-    fs::write(
-        fixture.plan.data_dir.join("business.txt"),
-        b"target-written-data",
-    )
-    .unwrap();
-    assert_eq!(
-        recover(&fixture.plan.work_directory, false, &mut control)
-            .unwrap_err()
-            .code,
-        "RECOVERY_AUTHORIZATION_REQUIRED"
-    );
-    // Keep damaged immutable assets as evidence and reconstruct the complete
-    // original tree, rather than replacing only its executable.
-    let web = native.source_root.join("share/web");
-    fs::set_permissions(&web, fs::Permissions::from_mode(0o644)).unwrap();
-    fs::write(&web, b"damaged-original-web").unwrap();
-    fs::set_permissions(&web, fs::Permissions::from_mode(0o444)).unwrap();
-    control.active = false;
-    let recovered = recover(&fixture.plan.work_directory, true, &mut control).unwrap();
-    assert_eq!(recovered.phase, UpgradePhase::RolledBack);
-    assert_eq!(
-        fs::read_link(&native.current_link).unwrap(),
-        native.source_root
-    );
-    assert_eq!(
-        snapshot::inventory(
-            &native.source_root,
-            true,
-            fixture.plan.max_backup_bytes,
-            false
-        )
-        .unwrap(),
-        original
-    );
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-    assert_eq!(
-        inspect_status(&fixture.plan.work_directory)
-            .unwrap()
-            .installed_program,
-        "original"
-    );
-    assert!(
-        native
-            .source_root
-            .parent()
-            .unwrap()
-            .join(format!(
-                ".upgrade-displaced-original-{}",
-                recovered.operation_id
-            ))
-            .is_dir()
-    );
-}
-
-#[test]
-fn interrupted_complete_root_repair_resumes_without_using_an_unknown_selector() {
-    use std::os::unix::fs::symlink;
-    let mut fixture = Fixture::new();
-    fixture.use_complete_release();
-    let native = fixture.plan.native_release.clone().unwrap();
-    let mut control = fixture.control();
-    let mut journal = apply(&fixture.plan, &mut control).unwrap();
-    journal.phase = UpgradePhase::RecoveryRestoring;
-    journal
-        .native_backup
-        .as_mut()
-        .unwrap()
-        .source_recovery_started = true;
-    save(&journal).unwrap();
-    fs::remove_file(&native.current_link).unwrap();
-    symlink(&native.source_root, &native.current_link).unwrap();
-    let displaced = native.source_root.parent().unwrap().join(format!(
-        ".upgrade-displaced-original-{}",
-        journal.operation_id
-    ));
-    fs::rename(&native.source_root, &displaced).unwrap();
-    control.active = false;
-    let recovered = recover(&fixture.plan.work_directory, true, &mut control).unwrap();
-    assert_eq!(recovered.phase, UpgradePhase::RolledBack);
-    assert_eq!(
-        fs::read(native.source_root.join("share/web")).unwrap(),
-        b"original-web"
-    );
-    assert_eq!(
-        fs::read_link(&native.current_link).unwrap(),
-        native.source_root
-    );
-}
-
-#[test]
-fn complete_release_checksum_or_selector_drift_fails_before_data_mutation() {
-    let mut fixture = Fixture::new();
-    fixture.use_complete_release();
-    let native = fixture.plan.native_release.clone().unwrap();
-    let web = fixture
-        .plan
-        .target_binary
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("share/web");
-    fs::set_permissions(&web, fs::Permissions::from_mode(0o644)).unwrap();
-    fs::write(&web, b"changed-web").unwrap();
-    fs::set_permissions(&web, fs::Permissions::from_mode(0o444)).unwrap();
-    let mut control = fixture.control();
-    assert!(apply(&fixture.plan, &mut control).is_err());
-    assert!(!control.active);
-    assert!(!fixture.plan.data_dir.join(PENDING).exists());
-    assert_eq!(
-        fs::read_link(&native.current_link).unwrap(),
-        native.source_root
-    );
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-}
-
-/// Only service-manager/validator observations are simulated. Signatures,
-/// immutable backups, binaries, paths, journals and lock interactions are real.
-struct MockControl {
-    schema: SchemaIdentity,
-    current_identity: ReleaseIdentity,
-    target_identity: ReleaseIdentity,
-    identity_calls: usize,
-    active: bool,
-    active_services: BTreeSet<String>,
-    fail_start: bool,
-    mutate_validator: bool,
-    validate_calls: usize,
-    fail_target_validation: bool,
-    uncovered_state: Option<PathBuf>,
-    delegated_probe: bool,
-    delegated_probe_complete: bool,
-}
-
-impl ServiceControl for MockControl {
-    fn verify_release_identity(
-        &mut self,
-        _: &Path,
-        plan: &UpgradePlan,
-        expected: &ReleaseIdentity,
-    ) -> anyhow::Result<()> {
-        self.identity_calls += 1;
-        let actual = if self.identity_calls == 1 {
-            ensure!(
-                !plan.data_dir.join(PENDING).exists(),
-                "source check is late"
-            );
-            ensure!(!plan.work_directory.exists(), "source check is late");
-            &self.current_identity
-        } else {
-            &self.target_identity
-        };
-        ensure!(
-            actual == expected,
-            "observed identity differs from authority"
-        );
-        Ok(())
-    }
-    fn is_stopped(&mut self, plan: &UpgradePlan) -> anyhow::Result<bool> {
-        Ok(!self.active && !self.active_services.contains(&plan.service))
-    }
-    fn start(&mut self, plan: &UpgradePlan) -> anyhow::Result<()> {
-        ensure!(
-            !plan.data_dir.join(PENDING).exists(),
-            "pending gate still exists"
-        );
-        let state = PrivateStateDirectory::open_for_administration(&plan.data_dir)?;
-        let _lock = state.try_instance_lock()?;
-        ensure!(!self.fail_start, "injected start failure");
-        self.active = true;
-        Ok(())
-    }
-    fn validate(
-        &mut self,
-        binary: &Path,
-        plan: &UpgradePlan,
-        _: Option<&ReleaseArtifact>,
-    ) -> anyhow::Result<ValidatedState> {
-        self.validate_calls += 1;
-        ensure!(
-            plan.data_dir.join(PENDING).exists(),
-            "validation lacks pending gate"
-        );
-        ensure!(
-            PrivateStateDirectory::open_for_administration(&plan.data_dir)?
-                .try_instance_lock()
-                .is_err(),
-            "validation lacks exclusive maintenance"
-        );
-        if self.validate_calls == 2 {
-            ensure!(
-                binary == native_release::staged_binary(&inspect(&plan.work_directory)?)?,
-                "target validation did not use sealed release"
-            );
-            ensure!(
-                !self.fail_target_validation,
-                "injected target-validation failure"
-            );
-            if self.delegated_probe {
-                run_product(
-                    binary,
-                    plan,
-                    &[
-                        "--exact".into(),
-                        "upgrade::tests::service_identity_probe".into(),
-                        "--ignored".into(),
-                        "--skip".into(),
-                        plan.data_dir
-                            .join("probe.json")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ],
-                    30,
-                )?;
-                self.delegated_probe_complete = true;
-            }
-        }
-        if self.mutate_validator && self.validate_calls == 2 {
-            fs::write(
-                plan.data_dir.join("business.txt"),
-                b"unexpected-validator-write",
-            )?;
-        }
-        Ok(ValidatedState {
-            schema_identity: self.schema.clone(),
-            state_paths: vec![
-                plan.data_dir.clone(),
-                plan.config.clone(),
-                self.uncovered_state
-                    .clone()
-                    .unwrap_or_else(|| plan.data_dir.clone()),
-            ],
-        })
-    }
-    fn ready(&mut self, _: &UpgradePlan, _: &str, _: &str) -> anyhow::Result<bool> {
-        Ok(self.active)
     }
 }
 
@@ -933,539 +1403,6 @@ fn ready_http_requires_one_matching_product_identity() {
 }
 
 #[test]
-fn root_diagnostic_override_is_signed_narrow_and_derived_from_the_fixed_entrypoint() {
-    let mut fixture = Fixture::new();
-    fixture.use_complete_release();
-    let mut artifact = fixture.release.artifact.clone().unwrap();
-    artifact.diagnostic_release_root_env = Some("FIXTURE_RELEASE_ROOT".into());
-    let binary = fixture.plan.target_binary.clone();
-    let root = binary.parent().unwrap().parent().unwrap();
-    let (name, derived) = native_release::diagnostic_environment(&binary, Some(&artifact))
-        .unwrap()
-        .unwrap();
-    assert_eq!(derived, root);
-    let probe = fixture._directory.path().join("probe/bin/server");
-    fs::create_dir_all(probe.parent().unwrap()).unwrap();
-    snapshot::copy_regular(Path::new("/usr/bin/env"), &probe, 0o700).unwrap();
-    let environment = native_release::diagnostic_environment(&probe, Some(&artifact))
-        .unwrap()
-        .unwrap();
-    let bytes = run_product_diagnostic(
-        &probe,
-        &fixture.plan,
-        &[],
-        5,
-        Some((&environment.0, &environment.1)),
-    )
-    .unwrap();
-    let values: BTreeSet<&str> = std::str::from_utf8(&bytes).unwrap().lines().collect();
-    let root_variable = format!("{name}={}", environment.1.display());
-    assert_eq!(
-        values,
-        BTreeSet::from(["PATH=/usr/bin:/bin", "LANG=C.UTF-8", root_variable.as_str()])
-    );
-    for name in [
-        "PATH",
-        "LD_PRELOAD",
-        "bad_RELEASE_ROOT",
-        "X_RELEASE_ROOT=invalid",
-    ] {
-        artifact.diagnostic_release_root_env = Some(name.into());
-        assert!(native_release::diagnostic_environment(&binary, Some(&artifact)).is_err());
-        fixture.release.artifact = Some(artifact.clone());
-        fixture.sign();
-        assert_eq!(
-            verify_release(&fixture.plan).unwrap_err().code,
-            "ARTIFACT_UNTRUSTED"
-        );
-        assert!(!fixture.plan.work_directory.exists());
-    }
-}
-
-#[test]
-fn incompatible_current_release_is_rejected_before_any_recovery_or_gate_write() {
-    for field in ["version", "source_revision", "state_contract_sha256"] {
-        let mut fixture = Fixture::new();
-        let mut control = fixture.control();
-        match field {
-            "version" => fixture.release.source_identity.version = "0.9.0".into(),
-            "source_revision" => fixture.release.source_identity.source_revision = "f".repeat(40),
-            _ => fixture.release.source_identity.state_contract_sha256 = "f".repeat(64),
-        }
-        fixture.sign();
-        let before = snapshot::inventory(&fixture.plan.data_dir, true, 10_000_000, false).unwrap();
-        assert_eq!(
-            apply(&fixture.plan, &mut control).unwrap_err().code,
-            "CURRENT_RELEASE_INCOMPATIBLE"
-        );
-        assert_eq!(control.identity_calls, 1);
-        assert!(!fixture.plan.work_directory.exists());
-        assert!(!fixture.plan.data_dir.join(PENDING).exists());
-        assert!(!fixture.plan.data_dir.join(".xssc.lock").exists());
-        assert_eq!(
-            snapshot::inventory(&fixture.plan.data_dir, true, 10_000_000, false).unwrap(),
-            before
-        );
-        assert!(!control.active);
-    }
-}
-
-#[test]
-fn signed_same_structure_upgrade_preserves_state_and_hands_off_only_after_switch() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    let result = apply(&fixture.plan, &mut control).unwrap();
-    assert_eq!(result.phase, UpgradePhase::Ready);
-    assert!(result.backup_complete && result.new_program_may_have_written);
-    assert_eq!(
-        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
-        fixture.release.binary_sha256
-    );
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-    assert!(!fixture.plan.data_dir.join(PENDING).exists());
-    assert_eq!(
-        inspect(&fixture.plan.work_directory).unwrap().phase,
-        UpgradePhase::Ready
-    );
-    assert_eq!(
-        fs::metadata(fixture.plan.work_directory.join(JOURNAL))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-}
-
-#[test]
-fn rejects_untrusted_or_wrong_platform_artifacts_before_creating_recovery_state() {
-    let mut fixture = Fixture::new();
-    let mut control = fixture.control();
-    fs::write(&fixture.plan.release_signature, [0u8; 64]).unwrap();
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap_err().code,
-        "ARTIFACT_UNTRUSTED"
-    );
-    assert!(!control.active);
-    assert!(!fixture.plan.work_directory.exists());
-    fixture.release.identity.target = "aarch64-unknown-linux-gnu".into();
-    fixture.sign();
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap_err().code,
-        "ARTIFACT_UNTRUSTED"
-    );
-    fixture.release.identity.target = crate::FORMAL_RELEASE_TARGET.into();
-    fixture.sign();
-    fixture.plan.trusted_public_key_sha256 = "0".repeat(64);
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap_err().code,
-        "ARTIFACT_UNTRUSTED"
-    );
-}
-
-#[test]
-fn rejects_unsupported_conversion_without_relabeling_or_modifying_original_state() {
-    let mut fixture = Fixture::new();
-    let mut control = fixture.control();
-    fixture.release.target_schema.schema_revision = 2;
-    fixture.sign();
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap_err().code,
-        "STATE_INCOMPATIBLE"
-    );
-    assert!(!control.active);
-    assert!(!fixture.plan.work_directory.exists());
-    assert_eq!(
-        fs::read(fixture.plan.config).unwrap(),
-        b"{\"current\":true}\n"
-    );
-}
-
-#[test]
-fn interrupted_validation_restores_program_configuration_and_data_then_restarts_original() {
-    let fixture = Fixture::new();
-    let original = snapshot::digest_file(&fixture.plan.installed_binary).unwrap();
-    let mut control = fixture.control();
-    control.fail_target_validation = true;
-    apply(&fixture.plan, &mut control).unwrap_err();
-    let interrupted = inspect(&fixture.plan.work_directory).unwrap();
-    assert_eq!(interrupted.phase, UpgradePhase::BackupComplete);
-    assert!(!interrupted.new_program_may_have_written);
-    assert!(fixture.plan.data_dir.join(PENDING).exists());
-    let restored = recover(&fixture.plan.work_directory, false, &mut control).unwrap();
-    assert_eq!(restored.phase, UpgradePhase::RolledBack);
-    assert!(control.active);
-    assert_eq!(
-        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
-        original
-    );
-    assert!(!fixture.plan.data_dir.join(PENDING).exists());
-}
-
-#[test]
-fn detects_validator_side_effects_and_uses_verified_snapshot_for_recovery() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    control.mutate_validator = true;
-    apply(&fixture.plan, &mut control).unwrap_err();
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"unexpected-validator-write"
-    );
-    recover(&fixture.plan.work_directory, false, &mut control).unwrap();
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-}
-
-#[test]
-fn startup_failure_never_authorizes_discarding_new_writes_implicitly() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    control.fail_start = true;
-    apply(&fixture.plan, &mut control).unwrap_err();
-    assert_eq!(
-        inspect(&fixture.plan.work_directory).unwrap().phase,
-        UpgradePhase::StartIntent
-    );
-    fs::write(
-        fixture.plan.data_dir.join("business.txt"),
-        b"new-business-write",
-    )
-    .unwrap();
-    assert_eq!(
-        recover(&fixture.plan.work_directory, false, &mut control)
-            .unwrap_err()
-            .code,
-        "RECOVERY_AUTHORIZATION_REQUIRED"
-    );
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"new-business-write"
-    );
-    control.fail_start = false;
-    control.active = false;
-    recover(&fixture.plan.work_directory, true, &mut control).unwrap();
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-}
-
-#[test]
-fn recovery_start_interruption_also_protects_writes_before_a_second_restore() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    control.fail_target_validation = true;
-    apply(&fixture.plan, &mut control).unwrap_err();
-    control.fail_start = true;
-    recover(&fixture.plan.work_directory, false, &mut control).unwrap_err();
-    assert_eq!(
-        inspect(&fixture.plan.work_directory).unwrap().phase,
-        UpgradePhase::RecoveryStartIntent
-    );
-    assert_eq!(
-        recover(&fixture.plan.work_directory, false, &mut control)
-            .unwrap_err()
-            .code,
-        "RECOVERY_AUTHORIZATION_REQUIRED"
-    );
-}
-
-fn recover_after_runtime_growth_beyond_backup_budget(kind: ResourceType) {
-    let mut fixture = Fixture::new();
-    fixture.plan.max_backup_bytes =
-        fs::metadata(&fixture.plan.installed_binary).unwrap().len() + 1024;
-    let current = match kind {
-        ResourceType::Directory => fixture.plan.data_dir.join("business.txt"),
-        ResourceType::File => {
-            let external = fixture._directory.path().join("external-state");
-            fs::write(&external, b"original external state").unwrap();
-            fixture.plan.resources.push(PersistentResource {
-                name: "external".into(),
-                path: external.clone(),
-                kind,
-            });
-            fixture.release.resources.push(ReleaseResource {
-                name: "external".into(),
-                kind,
-            });
-            fixture.sign();
-            external
-        }
-    };
-    let original = fs::read(&current).unwrap();
-    let mut control = fixture.control();
-    let journal = apply(&fixture.plan, &mut control).unwrap();
-    assert_eq!(journal.phase, UpgradePhase::Ready);
-    let growth = vec![b'x'; fixture.plan.max_backup_bytes as usize + 1];
-    fs::write(&current, &growth).unwrap();
-    control.active = false;
-    assert_eq!(
-        recover(&fixture.plan.work_directory, false, &mut control)
-            .unwrap_err()
-            .code,
-        "RECOVERY_AUTHORIZATION_REQUIRED"
-    );
-    assert_eq!(fs::read(&current).unwrap(), growth);
-    let inspection = inspect_status(&fixture.plan.work_directory).unwrap();
-    assert!(inspection.journal.backup_complete);
-    assert_eq!(
-        inspection.persistent_state_verification,
-        "changed-or-unreadable"
-    );
-    let restored = recover(&fixture.plan.work_directory, true, &mut control).unwrap();
-    assert_eq!(restored.phase, UpgradePhase::RolledBack);
-    assert_eq!(fs::read(&current).unwrap(), original);
-    assert_eq!(
-        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
-        journal.original_binary_sha256
-    );
-    assert!(!fixture.plan.data_dir.join(PENDING).exists());
-    assert!(control.active);
-}
-
-#[test]
-fn authorized_recovery_allows_directory_growth_beyond_backup_budget() {
-    recover_after_runtime_growth_beyond_backup_budget(ResourceType::Directory);
-}
-
-#[test]
-fn authorized_recovery_allows_file_growth_beyond_backup_budget() {
-    recover_after_runtime_growth_beyond_backup_budget(ResourceType::File);
-}
-
-#[test]
-fn original_state_must_still_fit_the_complete_backup_budget() {
-    let mut fixture = Fixture::new();
-    fixture.plan.max_backup_bytes =
-        fs::metadata(&fixture.plan.installed_binary).unwrap().len() + 1024;
-    let oversized = vec![b'x'; fixture.plan.max_backup_bytes as usize + 1];
-    let current = fixture.plan.data_dir.join("business.txt");
-    fs::write(&current, &oversized).unwrap();
-    let mut control = fixture.control();
-    assert!(apply(&fixture.plan, &mut control).is_err());
-    let journal = inspect(&fixture.plan.work_directory).unwrap();
-    assert_eq!(journal.phase, UpgradePhase::BackupStarted);
-    assert!(!journal.backup_complete);
-    assert_eq!(control.validate_calls, 0);
-    assert_eq!(fs::read(current).unwrap(), oversized);
-}
-
-#[test]
-fn concurrent_instance_lock_prevents_backup_and_unknown_links_are_rejected() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    let state = PrivateStateDirectory::open(&fixture.plan.data_dir).unwrap();
-    let instance = state.try_instance_lock().unwrap();
-    apply(&fixture.plan, &mut control).unwrap_err();
-    assert_eq!(
-        inspect(&fixture.plan.work_directory).unwrap().phase,
-        UpgradePhase::MaintenanceIntent
-    );
-    assert!(!fixture.plan.work_directory.join("original-binary").exists());
-    instance.release().unwrap();
-    recover(&fixture.plan.work_directory, false, &mut control).unwrap();
-    let mut other = Fixture::new();
-    std::os::unix::fs::symlink(
-        other.plan.data_dir.join("business.txt"),
-        other.plan.data_dir.join("unsafe-link"),
-    )
-    .unwrap();
-    let mut control = other.control();
-    assert!(apply(&other.plan, &mut control).is_err());
-    assert_eq!(
-        inspect(&other.plan.work_directory).unwrap().phase,
-        UpgradePhase::BackupStarted
-    );
-    // Plan paths cannot point through a linked parent either.
-    other.plan.config = other.plan.data_dir.join("unsafe-link");
-    assert!(validate_plan(&other.plan).is_err());
-}
-
-#[test]
-fn recovery_refuses_corrupt_backup_before_overwriting_current_state() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    control.fail_target_validation = true;
-    apply(&fixture.plan, &mut control).unwrap_err();
-    fs::write(
-        fixture.plan.work_directory.join("resource-0/business.txt"),
-        b"corrupt-backup",
-    )
-    .unwrap();
-    assert_eq!(
-        recover(&fixture.plan.work_directory, false, &mut control)
-            .unwrap_err()
-            .code,
-        "RECOVERY_STATE_INVALID"
-    );
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-}
-
-#[test]
-fn product_external_state_must_be_covered_before_switch() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    control.uncovered_state = Some(fixture._directory.path().join("external-media"));
-    let error = apply(&fixture.plan, &mut control).unwrap_err();
-    assert_eq!(error.code, "UPGRADE_RESOURCE_COVERAGE_FAILED");
-    assert_eq!(
-        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
-        inspect(&fixture.plan.work_directory)
-            .unwrap()
-            .original_binary_sha256
-    );
-    assert_eq!(
-        recover(&fixture.plan.work_directory, false, &mut control)
-            .unwrap_err()
-            .code,
-        "RECOVERY_EXECUTION_FAILED"
-    );
-    assert!(!control.active);
-    assert!(fixture.plan.data_dir.join(PENDING).exists());
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-}
-
-#[test]
-fn external_configuration_file_is_snapshotted_and_restored_with_the_original_program_and_tree() {
-    let mut fixture = Fixture::new();
-    let external = fixture._directory.path().join("external-config.json");
-    fs::rename(&fixture.plan.config, &external).unwrap();
-    fixture.plan.config = external.clone();
-    fixture.plan.resources.insert(
-        0,
-        PersistentResource {
-            name: "config".into(),
-            path: external.clone(),
-            kind: ResourceType::File,
-        },
-    );
-    fixture.release.resources.insert(
-        0,
-        ReleaseResource {
-            name: "config".into(),
-            kind: ResourceType::File,
-        },
-    );
-    fixture.sign();
-    let before = fs::read(&external).unwrap();
-    let mut control = fixture.control();
-    control.fail_start = true;
-    assert!(apply(&fixture.plan, &mut control).is_err());
-    fs::write(&external, b"changed-after-target-start").unwrap();
-    assert_eq!(
-        recover(&fixture.plan.work_directory, false, &mut control)
-            .unwrap_err()
-            .code,
-        "RECOVERY_AUTHORIZATION_REQUIRED"
-    );
-    assert_eq!(fs::read(&external).unwrap(), b"changed-after-target-start");
-    control.fail_start = false;
-    assert_eq!(
-        recover(&fixture.plan.work_directory, true, &mut control)
-            .unwrap()
-            .phase,
-        UpgradePhase::RolledBack
-    );
-    assert_eq!(fs::read(&external).unwrap(), before);
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"business-before-upgrade"
-    );
-    assert_eq!(
-        snapshot::digest_file(&fixture.plan.installed_binary).unwrap(),
-        snapshot::digest_file(Path::new("/usr/bin/false")).unwrap()
-    );
-}
-
-#[test]
-fn offline_tool_refuses_running_servers_before_journal_or_gate_and_rechecks_recovery() {
-    let fixture = Fixture::new();
-    let mut control = fixture.control();
-    control.active = true;
-    let original = fs::read(&fixture.plan.installed_binary).unwrap();
-    let config = fs::read(&fixture.plan.config).unwrap();
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap_err().code,
-        "SERVER_MUST_BE_STOPPED"
-    );
-    assert!(control.active);
-    assert!(!fixture.plan.work_directory.exists());
-    assert!(!fixture.plan.data_dir.join(PENDING).exists());
-    assert_eq!(fs::read(&fixture.plan.installed_binary).unwrap(), original);
-    assert_eq!(fs::read(&fixture.plan.config).unwrap(), config);
-    // The operator stops the service before invoking the auxiliary tool.
-    control.active = false;
-    apply(&fixture.plan, &mut control).unwrap();
-    fs::write(
-        fixture.plan.data_dir.join("business.txt"),
-        b"new-business-write",
-    )
-    .unwrap();
-    assert_eq!(
-        recover(&fixture.plan.work_directory, true, &mut control)
-            .unwrap_err()
-            .code,
-        "SERVER_MUST_BE_STOPPED"
-    );
-    assert!(control.active);
-    assert_eq!(
-        fs::read(fixture.plan.data_dir.join("business.txt")).unwrap(),
-        b"new-business-write"
-    );
-    control.active = false;
-    assert_eq!(
-        recover(&fixture.plan.work_directory, true, &mut control)
-            .unwrap()
-            .phase,
-        UpgradePhase::RolledBack
-    );
-}
-
-#[test]
-fn signed_additional_writer_mapping_cannot_be_omitted_or_snapshot_an_active_companion() {
-    let mut fixture = Fixture::new();
-    fixture.release.additional_service_roles = vec!["recording-writer".into()];
-    fixture.sign();
-    let mut control = fixture.control();
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap_err().code,
-        "ARTIFACT_UNTRUSTED"
-    );
-    assert!(!fixture.plan.work_directory.exists());
-    fixture.plan.additional_services = vec![AdditionalService {
-        role: "recording-writer".into(),
-        service: "fixture-recordings.service".into(),
-    }];
-    control
-        .active_services
-        .insert("fixture-recordings.service".into());
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap_err().code,
-        "SERVER_MUST_BE_STOPPED"
-    );
-    assert!(!control.active);
-    assert!(!fixture.plan.work_directory.exists());
-    assert!(!fixture.plan.data_dir.join(PENDING).exists());
-    control.active_services.clear();
-    assert_eq!(
-        apply(&fixture.plan, &mut control).unwrap().phase,
-        UpgradePhase::Ready
-    );
-}
-
-#[test]
 fn service_observation_requires_a_loaded_stopped_unit_and_zero_main_pid() {
     for state in ["inactive", "failed"] {
         let report = format!("LoadState=loaded\nMainPID=0\nActiveState={state}\n");
@@ -1486,6 +1423,183 @@ fn service_observation_requires_a_loaded_stopped_unit_and_zero_main_pid() {
     assert!(
         stopped_service_report(
             b"LoadState=loaded\nLoadState=not-found\nMainPID=0\nActiveState=inactive\n"
+        )
+        .is_err()
+    );
+}
+
+// Native startup control tests use only this isolated declared product fixture.
+pub(super) fn startup_fixture() -> (tempfile::TempDir, UpgradeJournal) {
+    let fixture = Fixture::product("xcos");
+    let mut control = fixture.control();
+    control.fail_precheck_identity = true;
+    apply(&fixture.plan, &mut control).unwrap_err();
+    let mut journal = inspect(&fixture.plan.work_directory).unwrap();
+    journal.phase = UpgradePhase::MaintenanceIntent;
+    journal.plan.additional_services.push(AdditionalService {
+        role: "mediamtx".into(),
+        service: "xcos-mediamtx.service".into(),
+    });
+    journal
+        .release
+        .additional_service_roles
+        .push("mediamtx".into());
+    save(&journal).unwrap();
+    (fixture._directory, journal)
+}
+
+// Collection tests retain the real verified payload and all completed backups.
+pub(super) fn collection_fixture() -> (tempfile::TempDir, UpgradeJournal) {
+    let fixture = Fixture::new();
+    let mut control = fixture.control();
+    let journal = apply(&fixture.plan, &mut control).unwrap();
+    (fixture._directory, journal)
+}
+
+#[test]
+fn runtime_lock_inode_survives_upgrade_and_authorized_recovery() {
+    use std::os::fd::AsFd;
+    let fixture = Fixture::new();
+    let path = fixture.plan.data_dir.join(".state-instance.lock");
+    let inode = fs::symlink_metadata(&path).unwrap().ino();
+    let mut control = fixture.control();
+    control.fail_start = true;
+    assert!(apply(&fixture.plan, &mut control).is_err());
+    assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+    let journal = inspect(&fixture.plan.work_directory).unwrap();
+    assert_eq!(journal.runtime_locks.len(), 1);
+    assert!(
+        journal
+            .backups
+            .iter()
+            .flat_map(|b| &b.entries)
+            .all(|entry| entry.path != Path::new(".state-instance.lock"))
+    );
+    control.fail_start = false;
+    recover(&fixture.plan.work_directory, true, &mut control).unwrap();
+    assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+    let file = File::open(&path).unwrap();
+    rustix::fs::flock(
+        file.as_fd(),
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .unwrap();
+}
+#[test]
+fn restoration_preserves_nested_held_lock_and_rejects_second_open_description() {
+    use std::os::fd::AsFd;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("data");
+    let backup = temp.path().join("backup");
+    snapshot::private_directory(&root).unwrap();
+    snapshot::private_directory(&root.join("nested")).unwrap();
+    let lock = root.join("nested/instance.lock");
+    fs::write(&lock, b"").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(root.join("nested/state"), b"original").unwrap();
+    let held = File::open(&lock).unwrap();
+    let inode = held.metadata().unwrap().ino();
+    rustix::fs::flock(
+        held.as_fd(),
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .unwrap();
+    let excluded = vec![lock.clone()];
+    let entries =
+        snapshot::inventory_preserving(&root, true, 4096, true, false, &excluded).unwrap();
+    let owners = snapshot::ownership(&root, &entries).unwrap();
+    snapshot::snapshot(&root, &backup, &entries).unwrap();
+    for _ in 0..2 {
+        fs::write(root.join("nested/state"), b"new").unwrap();
+        fs::write(root.join("extra"), b"remove").unwrap();
+        snapshot::restore_preserving(
+            &backup,
+            &root,
+            &entries,
+            u64::MAX,
+            &owners,
+            false,
+            snapshot::Preserved {
+                files: &excluded,
+                directories: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("nested/state")).unwrap(), b"original");
+        assert_eq!(fs::symlink_metadata(&lock).unwrap().ino(), inode);
+        assert!(
+            rustix::fs::flock(
+                File::open(&lock).unwrap().as_fd(),
+                rustix::fs::FlockOperation::NonBlockingLockExclusive
+            )
+            .is_err()
+        );
+    }
+    drop(held);
+    rustix::fs::flock(
+        File::open(&lock).unwrap().as_fd(),
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .unwrap();
+}
+#[test]
+fn bounded_manager_children_receive_only_fixed_environment() {
+    let bytes = run_bounded("/usr/bin/env", &[], 3).unwrap();
+    let actual = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual,
+        BTreeSet::from(["PATH=/usr/bin:/bin", "LANG=C.UTF-8", "TZ=UTC"])
+    );
+}
+
+#[test]
+fn shared_directory_flock_preserves_inode_and_restores_all_business_contents() {
+    use std::os::fd::AsFd;
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("data");
+    let business = root.join("business");
+    let backup = temporary.path().join("backup");
+    snapshot::private_directory(&root).unwrap();
+    snapshot::private_directory(&business).unwrap();
+    fs::write(business.join("content"), b"original").unwrap();
+    let held = File::open(&business).unwrap();
+    let original_inode = held.metadata().unwrap().ino();
+    rustix::fs::flock(
+        held.as_fd(),
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .unwrap();
+    let entries = snapshot::inventory_preserving(&root, true, 4096, true, false, &[]).unwrap();
+    let owners = snapshot::ownership(&root, &entries).unwrap();
+    snapshot::snapshot(&root, &backup, &entries).unwrap();
+    fs::write(business.join("content"), b"new write").unwrap();
+    fs::write(business.join("extra"), b"new extra").unwrap();
+    snapshot::restore_preserving(
+        &backup,
+        &root,
+        &entries,
+        u64::MAX,
+        &owners,
+        false,
+        snapshot::Preserved {
+            files: &[],
+            directories: std::slice::from_ref(&business),
+        },
+    )
+    .unwrap();
+    assert_eq!(fs::read(business.join("content")).unwrap(), b"original");
+    assert!(!business.join("extra").exists());
+    assert_eq!(
+        fs::symlink_metadata(&business).unwrap().ino(),
+        original_inode
+    );
+    assert!(
+        rustix::fs::flock(
+            File::open(&business).unwrap().as_fd(),
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
         )
         .is_err()
     );

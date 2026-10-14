@@ -9,16 +9,12 @@ use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub(super) const PENDING: &str = xcsc::state_file::MAINTENANCE_PENDING_FILE;
-pub(super) const COORDINATOR: &str = ".xssc.lock";
-const RESERVED: [&str; 4] = [
-    PENDING,
-    ".state-maintenance.lock",
-    ".state-instance.lock",
-    COORDINATOR,
-];
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_DEPTH: usize = 128;
+const MAX_ACL_BYTES: usize = 64 * 1024;
+const MAX_TOTAL_ACL_BYTES: usize = 32 * 1024 * 1024;
+const ACCESS_ACL: &str = "system.posix_acl_access";
+const DEFAULT_ACL: &str = "system.posix_acl_default";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -36,9 +32,16 @@ pub(super) struct Ownership {
     pub path: PathBuf,
     pub uid: u32,
     pub gid: u32,
+    // Empty bytes record absence, including the need to remove ACLs inherited
+    // while rebuilding a directory tree. Both fields are mandatory in journals.
+    pub access_acl: Vec<u8>,
+    pub default_acl: Vec<u8>,
+    pub mtime_seconds: i64,
+    pub mtime_nanoseconds: i64,
 }
 
 pub(super) fn ownership(root: &Path, entries: &[Entry]) -> anyhow::Result<Vec<Ownership>> {
+    let mut total_acl_bytes = 0usize;
     entries
         .iter()
         .map(|entry| {
@@ -47,11 +50,38 @@ pub(super) fn ownership(root: &Path, entries: &[Entry]) -> anyhow::Result<Vec<Ow
             } else {
                 root.join(&entry.path)
             };
-            let metadata = fs::symlink_metadata(path)?;
+            let file = open_entry(&path, entry)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.mode() & 0o7777 == entry.mode,
+                "state mode changed before ACL inventory"
+            );
+            let access_acl = read_acl(&file, ACCESS_ACL)?;
+            let default_acl = if entry.directory {
+                read_acl(&file, DEFAULT_ACL)?
+            } else {
+                Vec::new()
+            };
+            total_acl_bytes = total_acl_bytes
+                .checked_add(access_acl.len())
+                .and_then(|total| total.checked_add(default_acl.len()))
+                .context("ACL inventory size overflow")?;
+            ensure!(
+                total_acl_bytes <= MAX_TOTAL_ACL_BYTES,
+                "ACL inventory exceeds size limit"
+            );
+            ensure!(
+                stable(&metadata, &file.metadata()?),
+                "state permissions changed during ACL inventory"
+            );
             Ok(Ownership {
                 path: entry.path.clone(),
                 uid: metadata.uid(),
                 gid: metadata.gid(),
+                access_acl,
+                default_acl,
+                mtime_seconds: metadata.mtime(),
+                mtime_nanoseconds: metadata.mtime_nsec(),
             })
         })
         .collect()
@@ -62,24 +92,83 @@ pub(super) fn restore_ownership(
     entries: &[Entry],
     ownership: &[Ownership],
 ) -> anyhow::Result<()> {
+    restore_permissions(root, entries, ownership, true)
+}
+
+fn open_entry(path: &Path, entry: &Entry) -> anyhow::Result<File> {
+    require_path(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?;
+    let metadata = file.metadata()?;
     ensure!(
-        entries.len() == ownership.len(),
-        "ownership inventory length differs"
+        if entry.directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file() && metadata.nlink() == 1
+        },
+        "permission inventory resource type differs"
     );
+    let named = fs::symlink_metadata(path)?;
+    ensure!(
+        named.dev() == metadata.dev() && named.ino() == metadata.ino(),
+        "permission inventory resource identity changed"
+    );
+    Ok(file)
+}
+
+fn no_acl(error: rustix::io::Errno) -> bool {
+    error == rustix::io::Errno::NODATA || error == rustix::io::Errno::OPNOTSUPP
+}
+
+fn read_acl(file: &File, name: &str) -> anyhow::Result<Vec<u8>> {
+    let length = match rustix::fs::fgetxattr(file, name, &mut [0u8; 0]) {
+        Ok(length) => length,
+        Err(error) if no_acl(error) => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read bounded {name} size")),
+    };
+    ensure!(
+        length > 0 && length <= MAX_ACL_BYTES,
+        "POSIX ACL exceeds size limit"
+    );
+    let mut bytes = vec![0; length];
+    let read = rustix::fs::fgetxattr(file, name, bytes.as_mut_slice())
+        .with_context(|| format!("read bounded {name}"))?;
+    ensure!(read == length, "POSIX ACL changed during inventory");
+    Ok(bytes)
+}
+
+fn restore_acl(file: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    ensure!(bytes.len() <= MAX_ACL_BYTES, "ACL exceeds size limit");
+    if bytes.is_empty() {
+        match rustix::fs::fremovexattr(file, name) {
+            Ok(()) => {}
+            Err(error) if no_acl(error) => {}
+            Err(error) => return Err(error).with_context(|| format!("remove inherited {name}")),
+        }
+    } else {
+        rustix::fs::fsetxattr(file, name, bytes, rustix::fs::XattrFlags::empty())
+            .with_context(|| format!("restore {name}"))?;
+    }
+    ensure!(read_acl(file, name)? == bytes, "restored {name} differs");
+    Ok(())
+}
+
+fn restore_permissions(
+    root: &Path,
+    entries: &[Entry],
+    ownership: &[Ownership],
+    final_metadata: bool,
+) -> anyhow::Result<()> {
+    validate_ownership(entries, ownership)?;
     for (entry, owner) in entries.iter().zip(ownership).rev() {
-        ensure!(
-            entry.path.as_os_str() == owner.path.as_os_str(),
-            "ownership mapping differs"
-        );
         let path = if entry.path.as_os_str().is_empty() {
             root.to_owned()
         } else {
             root.join(&entry.path)
         };
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(&path)?;
+        let file = open_entry(&path, entry)?;
         let metadata = file.metadata()?;
         if metadata.uid() != owner.uid || metadata.gid() != owner.gid {
             rustix::fs::fchown(
@@ -88,10 +177,164 @@ pub(super) fn restore_ownership(
                 Some(rustix::process::Gid::from_raw(owner.gid)),
             )?;
         }
-        file.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+        if final_metadata {
+            // A prior access ACL may grant a different UID access when chmod
+            // widens its mask. Replace/remove it before publishing final mode.
+            restore_acl(&file, ACCESS_ACL, &owner.access_acl)?;
+            if entry.directory {
+                restore_acl(&file, DEFAULT_ACL, &owner.default_acl)?;
+            }
+        }
+        let mode = if !final_metadata && entry.directory {
+            0o700
+        } else {
+            entry.mode
+        };
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        if final_metadata {
+            ensure!(
+                read_acl(&file, ACCESS_ACL)? == owner.access_acl,
+                "chmod changed the restored access ACL"
+            );
+            // Directory modification times must be restored after all children
+            // exist. Access times are outside the persistent data contract.
+            rustix::fs::futimens(
+                &file,
+                &rustix::fs::Timestamps {
+                    last_access: rustix::fs::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: rustix::fs::UTIME_OMIT,
+                    },
+                    last_modification: rustix::fs::Timespec {
+                        tv_sec: owner.mtime_seconds,
+                        tv_nsec: owner.mtime_nanoseconds,
+                    },
+                },
+            )?;
+        }
+        let after = file.metadata()?;
+        ensure!(
+            after.uid() == owner.uid
+                && after.gid() == owner.gid
+                && after.mode() & 0o7777 == mode
+                && (!final_metadata
+                    || (after.mtime() == owner.mtime_seconds
+                        && after.mtime_nsec() == owner.mtime_nanoseconds)),
+            "restored ownership, mode or modification time differs"
+        );
         file.sync_all()?;
     }
     sync_parent(root)
+}
+
+pub(super) fn validate_ownership(entries: &[Entry], ownership: &[Ownership]) -> anyhow::Result<()> {
+    ensure!(
+        entries.len() == ownership.len(),
+        "ownership inventory length differs"
+    );
+    let mut total = 0usize;
+    for (entry, owner) in entries.iter().zip(ownership) {
+        ensure!(entry.path == owner.path, "ownership mapping differs");
+        ensure!(
+            (0..1_000_000_000).contains(&owner.mtime_nanoseconds),
+            "invalid modification time nanoseconds"
+        );
+        ensure!(
+            entry.mode & !0o777 == 0,
+            "ownership mode exceeds resource contract"
+        );
+        ensure!(
+            entry.directory || owner.default_acl.is_empty(),
+            "file has a default ACL"
+        );
+        for (bytes, access) in [(&owner.access_acl, true), (&owner.default_acl, false)] {
+            ensure!(bytes.len() <= MAX_ACL_BYTES, "ACL exceeds size limit");
+            if !bytes.is_empty() {
+                ensure!(
+                    bytes.len() >= 28
+                        && (bytes.len() - 4) % 8 == 0
+                        && bytes[..4] == 2u32.to_le_bytes(),
+                    "invalid Linux POSIX ACL encoding"
+                );
+                let mode = validate_acl(bytes)?;
+                ensure!(
+                    !access || mode == entry.mode,
+                    "access ACL mode differs from inventory"
+                );
+            }
+            total = total
+                .checked_add(bytes.len())
+                .context("ACL inventory size overflow")?;
+        }
+    }
+    ensure!(
+        total <= MAX_TOTAL_ACL_BYTES,
+        "ACL inventory exceeds size limit"
+    );
+    Ok(())
+}
+
+fn validate_acl(bytes: &[u8]) -> anyhow::Result<u32> {
+    let mut state = 0u8;
+    let mut owner = None;
+    let mut group = None;
+    let mut mask = None;
+    let mut other = None;
+    let mut last_user = None;
+    let mut last_group = None;
+    for entry in bytes[4..].as_chunks::<8>().0 {
+        let tag = u16::from_le_bytes(entry[..2].try_into()?);
+        let permission = u16::from_le_bytes(entry[2..4].try_into()?);
+        let id = u32::from_le_bytes(entry[4..].try_into()?);
+        ensure!(permission <= 7, "invalid ACL permission bits");
+        match tag {
+            1 => {
+                ensure!(state == 0 && id == u32::MAX, "invalid ACL owner entry");
+                owner = Some(u32::from(permission));
+                state = 1;
+            }
+            2 => {
+                ensure!(
+                    state == 1 && id != u32::MAX && last_user.is_none_or(|last| id > last),
+                    "invalid ACL named user"
+                );
+                last_user = Some(id);
+            }
+            4 => {
+                ensure!(state == 1 && id == u32::MAX, "invalid ACL group entry");
+                group = Some(u32::from(permission));
+                state = 2;
+            }
+            8 => {
+                ensure!(
+                    state == 2 && id != u32::MAX && last_group.is_none_or(|last| id > last),
+                    "invalid ACL named group"
+                );
+                last_group = Some(id);
+            }
+            16 => {
+                ensure!(state == 2 && id == u32::MAX, "invalid ACL mask entry");
+                mask = Some(u32::from(permission));
+                state = 3;
+            }
+            32 => {
+                ensure!(
+                    (state == 2 || state == 3) && id == u32::MAX,
+                    "invalid ACL other entry"
+                );
+                other = Some(u32::from(permission));
+                state = 4;
+            }
+            _ => anyhow::bail!("unknown POSIX ACL tag"),
+        }
+    }
+    ensure!(
+        state == 4 && (last_user.is_none() && last_group.is_none() || mask.is_some()),
+        "incomplete POSIX ACL"
+    );
+    Ok((owner.context("ACL owner is missing")? << 6)
+        | (mask.or(group).context("ACL group is missing")? << 3)
+        | other.context("ACL other is missing")?)
 }
 
 pub(super) fn require_path(path: &Path) -> anyhow::Result<()> {
@@ -203,7 +446,7 @@ pub(super) fn sync_parent(path: &Path) -> anyhow::Result<()> {
 
 pub(super) fn atomic_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     require_path(path)?;
-    let stage = path.with_file_name(format!(".upgrade-json-{}", uuid::Uuid::new_v4()));
+    let stage = path.with_file_name(format!(".state-atomic-{}", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -244,7 +487,7 @@ pub(super) fn inventory(
     root: &Path,
     directory: bool,
     max_bytes: u64,
-    primary: bool,
+    _primary: bool,
 ) -> anyhow::Result<Vec<Entry>> {
     let metadata = fs::symlink_metadata(root)?;
     let caller = rustix::process::geteuid().as_raw();
@@ -252,14 +495,14 @@ pub(super) fn inventory(
         caller == 0 || caller == metadata.uid(),
         "state belongs to another user"
     );
-    inventory_owned(root, directory, max_bytes, primary, metadata.uid())
+    inventory_owned(root, directory, max_bytes, _primary, metadata.uid())
 }
 
 pub(super) fn inventory_owned(
     root: &Path,
     directory: bool,
     max_bytes: u64,
-    primary: bool,
+    _primary: bool,
     owner_uid: u32,
 ) -> anyhow::Result<Vec<Entry>> {
     require_path(root)?;
@@ -269,29 +512,89 @@ pub(super) fn inventory_owned(
         root,
         Path::new(""),
         directory,
-        primary,
+        _primary,
         &mut entries,
         &mut total,
         max_bytes,
         0,
         owner_uid,
         false,
+        false,
+        &[],
     )?;
     Ok(entries)
 }
 
+/// The declared product helper has authorized this exact nonprivate business root.
+/// Existing ownership and group-write permissions are part of its data contract.
+pub(super) fn inventory_shared(
+    root: &Path,
+    directory: bool,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<Entry>> {
+    ensure!(
+        rustix::process::geteuid().as_raw() == 0,
+        "shared snapshots require the administrator tool"
+    );
+    require_path(root)?;
+    let mut entries = Vec::new();
+    visit(
+        root,
+        Path::new(""),
+        directory,
+        false,
+        &mut entries,
+        &mut 0,
+        max_bytes,
+        0,
+        0,
+        false,
+        true,
+        &[],
+    )?;
+    Ok(entries)
+}
+
+pub(super) fn inventory_preserving(
+    root: &Path,
+    directory: bool,
+    max_bytes: u64,
+    primary: bool,
+    shared: bool,
+    excluded: &[PathBuf],
+) -> anyhow::Result<Vec<Entry>> {
+    require_path(root)?;
+    let mut entries = Vec::new();
+    visit(
+        root,
+        Path::new(""),
+        directory,
+        primary,
+        &mut entries,
+        &mut 0,
+        max_bytes,
+        0,
+        fs::symlink_metadata(root)?.uid(),
+        false,
+        shared,
+        excluded,
+    )?;
+    Ok(entries)
+}
 #[allow(clippy::too_many_arguments)]
 fn visit(
     root: &Path,
     relative: &Path,
     expect_directory: bool,
-    primary: bool,
+    _primary: bool,
     entries: &mut Vec<Entry>,
     total: &mut u64,
     max_bytes: u64,
     depth: usize,
     owner_uid: u32,
     administrative_restore: bool,
+    shared: bool,
+    excluded: &[PathBuf],
 ) -> anyhow::Result<()> {
     ensure!(
         depth <= MAX_DEPTH && entries.len() < MAX_ENTRIES,
@@ -312,14 +615,15 @@ fn visit(
         "special files and symlinks are not accepted"
     );
     ensure!(
-        metadata.uid() == owner_uid
+        shared
+            || metadata.uid() == owner_uid
             || (administrative_restore
                 && rustix::process::geteuid().as_raw() == 0
                 && metadata.uid() == 0),
         "state must belong to the service user"
     );
     ensure!(
-        metadata.mode() & 0o6022 == 0,
+        metadata.mode() & if shared { 0o7002 } else { 0o7022 } == 0,
         "state cannot be writable by other users or setuid/setgid"
     );
     let (bytes, sha256) = if expect_directory {
@@ -349,10 +653,7 @@ fn visit(
         );
         children.sort_by_key(|entry| entry.file_name());
         for child in children {
-            if primary
-                && relative.as_os_str().is_empty()
-                && RESERVED.iter().any(|name| child.file_name() == *name)
-            {
+            if excluded.contains(&child.path()) {
                 continue;
             }
             let metadata = fs::symlink_metadata(child.path())?;
@@ -360,13 +661,15 @@ fn visit(
                 root,
                 &relative.join(child.file_name()),
                 metadata.is_dir(),
-                primary,
+                _primary,
                 entries,
                 total,
                 max_bytes,
                 depth + 1,
                 owner_uid,
                 administrative_restore,
+                shared,
+                excluded,
             )?;
         }
         let after = fs::symlink_metadata(&path)?;
@@ -379,6 +682,15 @@ fn visit(
 }
 
 pub(super) fn snapshot(source: &Path, target: &Path, entries: &[Entry]) -> anyhow::Result<()> {
+    snapshot_recorded(source, target, entries, |_, _| Ok(()))
+}
+
+pub(super) fn snapshot_recorded(
+    source: &Path,
+    target: &Path,
+    entries: &[Entry],
+    mut record: impl FnMut(&Path, &fs::Metadata) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     for entry in entries {
         let source = if entry.path.as_os_str().is_empty() {
             source.to_path_buf()
@@ -396,6 +708,9 @@ pub(super) fn snapshot(source: &Path, target: &Path, entries: &[Entry]) -> anyho
             // newly created staging directories writable until all children
             // are copied, then seal them from leaves to root.
             builder.mode(0o700).create(&target)?;
+            if entry.path.as_os_str().is_empty() {
+                record(&target, &fs::symlink_metadata(&target)?)?;
+            }
             sync_parent(&target)?;
         } else {
             copy_regular(&source, &target, entry.mode)?;
@@ -417,25 +732,129 @@ pub(super) fn snapshot(source: &Path, target: &Path, entries: &[Entry]) -> anyho
     Ok(())
 }
 
-/// Recovery is repeatable only while the caller owns maintenance and the pending
-/// gate. Lock files and the gate retain their inodes throughout restoration.
+/// Recovery requires the administrator to hold the installation tool lock and
+/// keep all declared writers stopped with startup controlled by the OS.
+#[cfg(test)]
 pub(super) fn restore(
     source: &Path,
     target: &Path,
     entries: &[Entry],
-    primary: bool,
+    _primary: bool,
     max_bytes: u64,
     ownership: &[Ownership],
 ) -> anyhow::Result<()> {
-    require_path(target)?;
+    restore_with_policy(
+        source,
+        target,
+        entries,
+        _primary,
+        max_bytes,
+        ownership,
+        false,
+        &[],
+        &[],
+    )
+}
+
+#[cfg(test)]
+pub(super) fn restore_shared(
+    source: &Path,
+    target: &Path,
+    entries: &[Entry],
+    max_bytes: u64,
+    ownership: &[Ownership],
+) -> anyhow::Result<()> {
     ensure!(
-        entries.len() == ownership.len()
-            && entries
-                .iter()
-                .zip(ownership)
-                .all(|(entry, owner)| entry.path.as_os_str() == owner.path.as_os_str()),
-        "restore ownership mapping differs"
+        rustix::process::geteuid().as_raw() == 0,
+        "shared restoration requires the administrator tool"
     );
+    restore_with_policy(
+        source,
+        target,
+        entries,
+        false,
+        max_bytes,
+        ownership,
+        true,
+        &[],
+        &[],
+    )
+}
+
+pub(super) struct Preserved<'a> {
+    pub files: &'a [PathBuf],
+    pub directories: &'a [PathBuf],
+}
+pub(super) fn restore_preserving(
+    source: &Path,
+    target: &Path,
+    entries: &[Entry],
+    max_bytes: u64,
+    ownership: &[Ownership],
+    shared: bool,
+    preserved: Preserved<'_>,
+) -> anyhow::Result<()> {
+    ensure!(
+        !preserved.files.contains(&target.to_owned()),
+        "a runtime lock cannot be restored as a resource"
+    );
+    restore_with_policy(
+        source,
+        target,
+        entries,
+        false,
+        max_bytes,
+        ownership,
+        shared,
+        preserved.files,
+        preserved.directories,
+    )
+}
+fn clear_preserving(
+    directory: &Path,
+    excluded: &[PathBuf],
+    directories: &[PathBuf],
+) -> anyhow::Result<()> {
+    for child in fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()? {
+        let path = child.path();
+        if excluded.contains(&path) {
+            continue;
+        }
+        let info = fs::symlink_metadata(&path)?;
+        ensure!(
+            info.is_file() || info.is_dir(),
+            "restore refuses aliases and special files"
+        );
+        if info.is_dir() {
+            if excluded
+                .iter()
+                .chain(directories)
+                .any(|item| item.starts_with(&path))
+            {
+                clear_preserving(&path, excluded, directories)?;
+            } else {
+                fs::remove_dir_all(&path)?;
+            }
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+fn restore_with_policy(
+    source: &Path,
+    target: &Path,
+    entries: &[Entry],
+    _primary: bool,
+    max_bytes: u64,
+    ownership: &[Ownership],
+    shared: bool,
+    excluded: &[PathBuf],
+    directories: &[PathBuf],
+) -> anyhow::Result<()> {
+    require_path(target)?;
+    validate_ownership(entries, ownership)?;
     if entries.first().is_some_and(|entry| entry.directory) {
         let mut current = Vec::new();
         // A prior root-driven restore can stop between creating and assigning
@@ -445,13 +864,15 @@ pub(super) fn restore(
             target,
             Path::new(""),
             true,
-            primary,
+            _primary,
             &mut current,
             &mut 0,
             max_bytes,
             0,
             ownership[0].uid,
             true,
+            shared,
+            excluded,
         )?;
         // Make only verified owned directories writable during this authorized
         // restoration. No path aliases or special files reach deletion.
@@ -463,58 +884,40 @@ pub(super) fn restore(
             };
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
-        for child in fs::read_dir(target)?.collect::<Result<Vec<_>, _>>()? {
-            if primary && RESERVED.iter().any(|name| child.file_name() == *name) {
-                continue;
-            }
-            let metadata = fs::symlink_metadata(child.path())?;
-            ensure!(
-                !metadata.file_type().is_symlink(),
-                "recovery refuses symbolic links"
-            );
-            if metadata.is_dir() {
-                fs::remove_dir_all(child.path())?;
-            } else {
-                ensure!(metadata.is_file(), "recovery refuses special files");
-                fs::remove_file(child.path())?;
-            }
-        }
+        clear_preserving(target, excluded, directories)?;
         for (entry, owner) in entries.iter().zip(ownership).skip(1) {
             let path = target.join(&entry.path);
             if entry.directory {
-                fs::DirBuilder::new().mode(0o700).create(&path)?;
+                if !named_exists(&path)? {
+                    fs::DirBuilder::new().mode(0o700).create(&path)?;
+                }
             } else {
                 copy_regular(&source.join(&entry.path), &path, entry.mode)?;
             }
-            restore_ownership(
+            restore_permissions(
                 &path,
                 &[Entry {
                     path: PathBuf::new(),
-                    // Keep directories writable until their children have
-                    // been restored; the reverse pass below seals them.
-                    mode: if entry.directory { 0o700 } else { entry.mode },
                     ..entry.clone()
                 }],
                 &[Ownership {
                     path: PathBuf::new(),
                     ..owner.clone()
                 }],
+                // An access ACL's mask can make a temporary 0700 directory
+                // read-only. Restore exact ACLs only after its children exist.
+                !entry.directory,
             )?;
-        }
-        for entry in entries.iter().rev().filter(|entry| entry.directory) {
-            let directory = if entry.path.as_os_str().is_empty() {
-                target.to_path_buf()
-            } else {
-                target.join(&entry.path)
-            };
-            fs::set_permissions(&directory, fs::Permissions::from_mode(entry.mode))?;
-            sync_directory(&directory)?;
         }
     } else {
         if named_exists(target)? {
-            inventory(target, false, max_bytes, false)?;
+            if shared {
+                inventory_shared(target, false, max_bytes)?;
+            } else {
+                inventory(target, false, max_bytes, false)?;
+            }
         }
-        let stage = target.with_file_name(format!(".upgrade-restore-{}", uuid::Uuid::new_v4()));
+        let stage = target.with_file_name(format!(".state-atomic-{}", uuid::Uuid::new_v4()));
         copy_regular(source, &stage, entries[0].mode)?;
         restore_ownership(&stage, entries, ownership)?;
         fs::rename(stage, target)?;

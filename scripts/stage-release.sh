@@ -17,6 +17,7 @@ print(package["version"])
 PY
 )
 target=x86_64-unknown-linux-gnu
+: "${XSSI_BUILD_TOOLS_DIR:?Provide the pinned clean xssi source checkout}"
 revision=$(git rev-parse HEAD)
 if [[ -n $(git status --porcelain --untracked-files=normal) ]]; then
   echo "formal release staging requires a clean source tree" >&2
@@ -37,27 +38,17 @@ fi
 
 umask 077
 mkdir -p "$output/package/bin" "$output/package/LICENSES" "$output/package/libexec" "$output/release-tools"
+unset SQLITE3_LIB_DIR SQLITE3_INCLUDE_DIR LIBSQLITE3_SYS_USE_PKG_CONFIG SQLCIPHER_LIB_DIR SQLCIPHER_INCLUDE_DIR
 XSSC_SOURCE_REVISION="$revision" cargo build --locked --release --target "$target"
-install -m 0755 "target/${target}/release/xssc" "$output/package/bin/xssc"
-install -m 0755 scripts/stage-upgrade-release.py "$output/package/libexec/stage-upgrade-release.py"
+install -m 0755 "${CARGO_TARGET_DIR:-target}/${target}/release/xssc" "$output/package/bin/xssc"
 python3 scripts/stage-release-docs.py stage \
   --source-root "$PWD" --package-root "$output/package" --version "$version"
 install -m 0644 LICENSE-APACHE "$output/package/LICENSES/Apache-2.0.txt"
-install -m 0644 release/xssc-release-signing-public.pem \
-  "$output/package/RELEASE-SIGNING-PUBLIC.pem"
 install -m 0644 scripts/finalize-release.sh scripts/stage-release-docs.py "$output/release-tools/"
 "$output/package/bin/xssc" support --json >"$output/package/adapter-catalog.json"
-python3 scripts/write-sbom.py "$output/package/SBOM.cdx.json"
 rustc --version --verbose >"$output/package/BUILD-ENVIRONMENT.txt"
 binary_sha=$(sha256sum "$output/package/bin/xssc" | awk '{print $1}')
 catalog_sha=$(sha256sum "$output/package/adapter-catalog.json" | awk '{print $1}')
-release_signing_public_key_sha=$(
-  openssl pkey -pubin \
-    -in "$output/package/RELEASE-SIGNING-PUBLIC.pem" \
-    -outform DER \
-    | sha256sum \
-    | awk '{print $1}'
-)
 capabilities=$(python3 - "$output/package/adapter-catalog.json" "$revision" "$version" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -78,10 +69,9 @@ cat >"$output/package/release.json" <<EOF
   "rust_version": "1.99.0",
   "binary_sha256": "${binary_sha}",
   "catalog_sha256": "${catalog_sha}",
-  "release_signing_public_key_sha256": "${release_signing_public_key_sha}",
   "release_manifest_versions": [1],
   "upgrade_journal_version": 1,
-  "release_upgrade_protocol": "signed-product-state-systemd-v1",
+  "release_upgrade_protocol": "fixed-root-payload-v1",
   "supported_capabilities": ${capabilities}
 }
 EOF
@@ -100,4 +90,8 @@ cat >"$output/package/provenance.json" <<EOF
 EOF
 find "$output/package" -type d -exec chmod 0755 {} +
 find "$output/package" -type f -exec chmod 0644 {} +
-chmod 0755 "$output/package/libexec/stage-upgrade-release.py" "$output/package/bin/xssc" "$output/release-tools/finalize-release.sh"
+chmod 0755 "$output/package/bin/xssc" "$output/release-tools/finalize-release.sh"
+python3 scripts/write-sbom.py --stage "$output/package" --tools "$XSSI_BUILD_TOOLS_DIR" \
+  --source-revision "$revision" --target "$target"
+install -m 0644 "$XSSI_BUILD_TOOLS_DIR/scripts/release_manifest.py" \
+  "$XSSI_BUILD_TOOLS_DIR/scripts/release_sbom.py" "$output/release-tools/"

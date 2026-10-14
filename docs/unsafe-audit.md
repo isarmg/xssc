@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `src/upgrade/execution.rs::account`，NSS 调用及初始化读取 | 按 systemd 普通 User 配置解析当前 uid/gid；CString、64 KiB 临时缓冲区和 `MaybeUninit` 输出在同步调用期间存活。只在返回成功且返回指针精确等于给定输出地址后读取整数字段。 | std 没有 NSS 账户解析 API；不增加 shell、无界命令输出或额外账户解析驱动。临时真实 uid/gid 65534 的产品演练和服务身份拒绝测试验证实际降权及文件属主。 |
 | `src/upgrade/execution.rs::group_id`，NSS 调用及初始化读取 | 同样固定 64 KiB、成功和输出指针检查；数字 GID 使用安全解析直接返回。 | 不读取或输出 NSS 内部字符串，安全错误不反射系统配置；普通 User/Group 与数据目录身份必须相符。 |
-| `src/upgrade/process.rs::run_bounded_delegated`，`Command::pre_exec` | fork 后固定 FD 4 执行已验证文件，清辅助组后降 gid/uid；父进程保持文件及祖先句柄。闭包只有固定 libc 描述符和凭据调用，无分配、锁或异步运行时。 | 管道非阻塞与辅助组查询改用安全 rustix。`Command::uid/gid` 不能单独完成辅助组清除和固定执行 FD 继承；不把可写暂存树交给服务 uid。双管道字节/时间限制与 kill+wait 风险测试、真实 uid 产品演练验证。 |
+| `src/upgrade/process.rs::run_bounded_command`，`Command::pre_exec` | fork 后固定 FD 4 执行已验证文件，继承 root 身份和专用锁 FD 5；父进程保持文件及祖先句柄。闭包只有固定 libc 描述符和凭据调用，无分配、锁或异步运行时。 | 管道非阻塞与辅助组查询改用安全 rustix。固定执行 FD 与同 OFD 锁的继承只在子进程改变 CLOEXEC；服务 UID/GID 是独立辅助程序的显式数据参数。双管道字节/时间限制与 kill+wait 风险测试及临时权限/真实包清单校验。 |
 
 测试模块 `product_tests.rs` 的独立程序控制器另有一处最小 fork 后 uid/gid 切换，仅用于真正产品进程和临时私有夹具，不接入生产 systemd 控制器、不创建系统账户或系统服务。
 
@@ -23,7 +23,7 @@
 | 6、8 | 准备操作按真实阶段提供稳定码；秘密和子进程 stderr 不反射；整个包默认 deny，只允许表中必要窄边界。 |
 | 7、12、25 | 服务端正常运行严格当前契约且不知工具；当前离线升级严格绑定源与目标身份、停服、维护锁、配置和完整数据备份。 |
 | 13、14、21 | 保留业务任务/请求/指纹/不确定状态；输入和 SQLite 有界，风险测试验证拒绝、原子性、备份及锁冲突。 |
-| 20–23 | Linux 目标交叉 Clippy 检查只证明静态边界；原生 Linux CI 执行风险测试和签名脚本后才形成实际发行证据，夹具不代表真实 systemd 或设备。 |
+| 20–23 | Linux 目标交叉 Clippy 检查只证明静态边界；原生 Linux CI 执行风险测试和发行校验脚本后才形成实际发行证据，夹具不代表真实 systemd 或设备。 |
 
 本轮删除旧版本准备实现，保留当前数据安全边界。本轮原生风险测试数与结论以新 CI 为准，不继承以上 0.5.0 计数。
 

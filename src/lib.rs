@@ -1,4 +1,4 @@
-//! Offline current-release lifecycle tooling, never linked by product runtimes.
+//! SHA-256 verified fixed-root upgrade transactions, never linked by product runtimes.
 
 pub mod catalog;
 pub mod support;

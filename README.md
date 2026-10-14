@@ -1,50 +1,17 @@
 # xssc
 
-xssc 是服务端离线升级命令行工具，用于验证受签名发行物、执行当前合同下的软件切换，并在失败时按持久记录恢复。
+XSSC 是六个 server 的升级与恢复核心，升级脚本由独立的 XSSI 仓库提供。它没有常驻服务，也不被 server 运行时调用。
 
-## 项目功能
+用户运行已安装 ROOT 中的 `upgrade.sh --root /absolute/ROOT --version N.N.N`。脚本先下载并验证新版本，然后自动停止全部写入服务；XSSC 在独占维护下检查数据、备份、调用独立辅助程序只读检查源与目标当前结构、替换程序并启动服务，最后核验实际运行文件摘要和 `/readyz`。
 
-- 校验独立信任锚、签名、源码身份和完整发行目录。
-- 在停服和独占维护条件下保护配置、数据库与媒体等持久资源。
-- 记录升级阶段，检查事务状态，执行受控恢复与业务就绪验收。
-
-## 适用平台
-
-仅支持 Linux x86_64 GNU（glibc）；需要本机 systemd、支持 Ed25519 的 `/usr/bin/openssl`、Zstandard 和校验工具。无需配对，没有常驻服务。
-
-## 快速部署
-
-下载 [v1.0.3 发行包及校验文件](https://github.com/isarmg/xssc/releases/tag/v1.0.3)，在独立空目录中执行：
+仅支持 Linux x86_64 GNU 和 systemd。发行校验使用 SHA256 清单及逐文件摘要；业务所需的 TLS 与密码保护由对应服务和辅助程序处理。六个产品使用唯一的固定 ROOT 包合同；不接受旧布局、旧升级清单、旧 CLI 或旧数据格式。安装与离线管理见独立的 [XSSI 仓库](https://github.com/isarmg/xssi)，卸载由用户处理。
 
 ```sh
-set -eu
-sha256sum --check xssc-1.0.3-linux-x86_64.tar.zst.sha256
-mkdir xssc-1.0.3
-tar --zstd -xf xssc-1.0.3-linux-x86_64.tar.zst --no-same-owner -C xssc-1.0.3
-cd xssc-1.0.3
-# 必须从独立可信渠道取得指纹，不使用包内自报值。
-EXPECTED_KEY_SHA256='替换为可信发行公钥的64位小写DER-SHA256指纹'
-ACTUAL_KEY_SHA256=$(/usr/bin/openssl pkey -pubin -in RELEASE-SIGNING-PUBLIC.pem -outform DER | sha256sum | cut -d ' ' -f 1)
-test "$ACTUAL_KEY_SHA256" = "$EXPECTED_KEY_SHA256"
-/usr/bin/openssl pkeyutl -verify -rawin -pubin -inkey RELEASE-SIGNING-PUBLIC.pem -in SHA256SUMS -sigfile SHA256SUMS.sig
-sha256sum --check SHA256SUMS
-sudo install -o root -g root -m 0755 bin/xssc /usr/local/bin/xssc
-/usr/local/bin/xssc support --json
-/usr/local/bin/xssc apply-upgrade --help
-```
-
-保留完整包中的文档与发行身份。实际升级前按详细文档准备私有计划、产品签名信任锚并停止全部相关写入进程，再运行 `xssc apply-upgrade --plan /absolute/private/plan.json`。恢复默认保护交接运行权后的新增写入；不要把 `--allow-data-loss` 用作常规重试。
-
-## 编译部署
-
-准备 Rust `1.99.0`、C 编译工具链及上述运行依赖，在仓库根目录执行：
-
-```sh
-cargo build --release --locked
+cargo build --locked --release
 ./target/release/xssc support --json
 ./target/release/xssc apply-upgrade --help
 ```
 
-这是未绑定正式发行源码身份的开发构建，用于开发验证。生产部署使用完成签名和验收的发行包；自行制作正式包须按文档执行源码身份绑定、完整包构建与签名流程。
+核心仍提供 `apply-upgrade --plan PATH`、`inspect-upgrade --work-directory PATH` 和 `recover-upgrade --work-directory PATH`。日常升级由 XSSI 脚本生成计划，无需手工重复配置路径。恢复默认保护服务可能启动后产生的新增写入；`--allow-data-loss` 只用于用户明确授权的数据恢复。
 
-[详细文档](docs/README.md)
+[操作文档](docs/README.md)

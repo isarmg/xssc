@@ -151,16 +151,17 @@ def entry_documents(version):
     return {
         "README.md": (
             f"# xssc {version}\n\n"
-            "Linux AMD64 GNU 离线维护工具。先停止全部持久状态写入进程，再以独立可信身份验证程序和计划。\n\n"
+            "Linux AMD64 GNU 升级与恢复工具。由 XSSI 脚本下载并校验发行包后，控制并停止全部持久状态写入服务，再执行离线维护。\n\n"
             "- [操作、恢复和发行条件](docs/operations.md)\n"
-            "- [受签名发行物的完整升级合同](docs/offline-upgrades.md)\n"
+            "- [经 SHA-256 校验发行物的完整升级合同](docs/offline-upgrades.md)\n"
             "- [Linux 安装、诊断和卸载](docs/platform-setup.md)\n\n"
-            "程序为 `bin/xssc`，制品定义助手为 `libexec/stage-upgrade-release.py`。"
-            "`SHA256SUMS` 和 `SHA256SUMS.sig` 覆盖程序、文档和其余发行文件；公钥必须从独立可信源码取得。\n"
+            "程序为 `bin/xssc`；产品安装、包生成及自动升级脚本由独立 XSSI 仓库交付。"
+            "`share/package.json` 声明程序、文档和其余发行文件的完整库存；"
+            "`share/package.sha256` 为该清单的 SHA256 摘要。归档另附 `.sha256` 校验文件。\n"
         ).encode(),
         "OFFLINE-UPGRADES.md": (
             "# 离线升级说明入口\n\n"
-            "完整字段、信任和恢复条件见[受签名离线升级合同](docs/offline-upgrades.md)。\n\n"
+            "完整字段、校验和恢复条件见[经 SHA-256 校验的离线升级合同](docs/offline-upgrades.md)。\n\n"
             "安装、诊断和卸载见[部署指南](docs/platform-setup.md)。\n"
         ).encode(),
     }

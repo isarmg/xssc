@@ -20,6 +20,8 @@ PINNED_OFFICIAL_ACTIONS = {
     # actions/upload-artifact v4.6.2 and download-artifact v4.3.0.
     "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
     "actions/download-artifact": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    # actions/setup-node v7.0.0, verified against the official Git tag.
+    "actions/setup-node": "820762786026740c76f36085b0efc47a31fe5020",
 }
 
 
@@ -348,6 +350,11 @@ jobs:
           persist-credentials: false
 """
     validate_workflow("positive-fixture.yml", base)
+    node = base + f"""      - uses: actions/setup-node@{PINNED_OFFICIAL_ACTIONS['actions/setup-node']}
+        with:
+          node-version: 26.7.0
+"""
+    validate_workflow("positive-node-fixture.yml", node)
     cases = {
         "floating action": base.replace(
             PINNED_OFFICIAL_ACTIONS["actions/checkout"], "v4"
@@ -356,6 +363,13 @@ jobs:
         "over-broad permissions": base.replace("contents: read", "contents: write"),
         "persisted checkout credentials": base.replace(
             "persist-credentials: false", "persist-credentials: true"
+        ),
+        "unreviewed action": node.replace("actions/setup-node", "actions/cache"),
+        "unreviewed setup-node commit": node.replace(
+            PINNED_OFFICIAL_ACTIONS["actions/setup-node"], "1" * 40
+        ),
+        "floating setup-node": node.replace(
+            PINNED_OFFICIAL_ACTIONS["actions/setup-node"], "v7"
         ),
     }
     for label, fixture in cases.items():
@@ -366,7 +380,7 @@ jobs:
         raise PolicyError(f"negative self-test unexpectedly accepted {label}")
     print(
         "workflow policy negative tests: passed "
-        "floating action/runner/permissions and checkout credentials"
+        "floating and unreviewed actions/runner/permissions and checkout credentials"
     )
 
 

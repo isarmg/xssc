@@ -1,734 +1,983 @@
-//! Complete immutable deployment trees. Product code defines its physical
-//! layout; this module never chooses a product, runs a shell or edits a unit.
-use super::{Entry, UpgradeJournal, UpgradePlan, UpgradeRelease, snapshot};
+//! SHA-256-verified payloads within one installation root. Configuration and persistent
+//! data never enter the list of files this module replaces.
+use super::{Entry, ReleaseResource, UpgradeJournal, UpgradePlan, UpgradeRelease, snapshot};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    os::{
+        fd::AsFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
 };
-use xcsc::state_file::{MaintenanceLock, PrivateStateDirectory};
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadFile {
+    pub path: PathBuf,
+    pub mode: String,
+    pub size: u64,
+    pub sha256: String,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageService {
+    pub name: String,
+    pub path: PathBuf,
+    pub role: String,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageManifest {
+    pub manifest_version: u32,
+    pub identity: xcsc::contracts::ReleaseIdentity,
+    pub schema_identity: xcsc::contracts::SchemaIdentity,
+    pub server: PathBuf,
+    pub setup: PathBuf,
+    pub services: Vec<PackageService>,
+    pub files: Vec<PayloadFile>,
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseArtifact {
     pub protocol: String,
-    pub root_layout: PathBuf,
     pub entrypoint: PathBuf,
+    pub setup: PathBuf,
     pub tree_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostic_release_root_env: Option<String>,
+    pub files: Vec<PayloadFile>,
 }
-
-fn validate_diagnostic_environment(name: &str) -> anyhow::Result<()> {
-    ensure!(
-        name.len() <= 64
-            && name.ends_with("_RELEASE_ROOT")
-            && name.len() > "_RELEASE_ROOT".len()
-            && name.as_bytes()[0].is_ascii_uppercase()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'),
-        "unsupported release-root diagnostic environment name"
-    );
-    Ok(())
-}
-
-pub(super) fn diagnostic_environment(
-    binary: &Path,
-    artifact: Option<&ReleaseArtifact>,
-) -> anyhow::Result<Option<(String, PathBuf)>> {
-    let Some(artifact) = artifact else {
-        return Ok(None);
-    };
-    let Some(name) = &artifact.diagnostic_release_root_env else {
-        return Ok(None);
-    };
-    validate_diagnostic_environment(name)?;
-    relative(&artifact.entrypoint)?;
-    let mut root = binary.to_owned();
-    for _ in artifact.entrypoint.components() {
-        ensure!(root.pop(), "diagnostic binary lacks its physical root");
-    }
-    snapshot::require_path(&root)?;
-    ensure!(
-        root.join(&artifact.entrypoint).as_os_str() == binary.as_os_str(),
-        "diagnostic entrypoint differs"
-    );
-    Ok(Some((name.clone(), root)))
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeReleasePlan {
-    pub current_link: PathBuf,
-    pub source_root: PathBuf,
-    pub install_root: PathBuf,
+    pub root: PathBuf,
+    pub source_manifest: PathBuf,
 }
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NativeBackup {
     pub source_entries: Vec<Entry>,
     pub target_entries: Vec<Entry>,
-    pub current_parent_device: u64,
-    pub current_parent_inode: u64,
-    pub source_directory_device: u64,
-    pub source_directory_inode: u64,
+    pub root_device: u64,
+    pub root_inode: u64,
     pub source_recovery_started: bool,
 }
 
 fn relative(path: &Path) -> anyhow::Result<()> {
     ensure!(
+        path.to_str()
+            .is_some_and(|name| !name.chars().any(char::is_control)),
+        "payload paths contain control characters"
+    );
+    ensure!(
         !path.as_os_str().is_empty()
+            && path.to_str().is_some()
             && path.as_os_str().as_encoded_bytes().len() <= 4096
             && path
                 .components()
                 .all(|part| matches!(part, Component::Normal(_)))
             && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str(),
-        "invalid immutable release relative path"
+        "invalid payload relative path"
     );
-    ensure!(path.to_str().is_some(), "release paths must be UTF-8");
     Ok(())
 }
-
-pub(super) fn validate_plan(plan: &UpgradePlan) -> anyhow::Result<()> {
-    let Some(native) = &plan.native_release else {
-        return Ok(());
-    };
-    for path in [&native.source_root, &native.install_root] {
-        snapshot::require_path(path)?;
+fn payload_path(path: &Path) -> anyhow::Result<()> {
+    relative(path)?;
+    ensure!(
+        matches!(
+            path.components().next().unwrap().as_os_str().to_str(),
+            Some("bin" | "libexec" | "share")
+        ) || matches!(
+            path.to_str(),
+            Some("install.sh" | "maintenance.sh" | "upgrade.sh")
+        ),
+        "payload cannot replace configuration or persistent state"
+    );
+    ensure!(
+        path != Path::new("share/package.json") && path != Path::new("share/package.sha256"),
+        "metadata cannot hash itself"
+    );
+    Ok(())
+}
+fn mode(file: &PayloadFile) -> anyhow::Result<u32> {
+    match file.mode.as_str() {
+        "0755" => Ok(0o755),
+        "0644" => Ok(0o644),
+        _ => anyhow::bail!("unsupported payload permissions"),
+    }
+}
+fn validate_files(files: &[PayloadFile]) -> anyhow::Result<()> {
+    ensure!(
+        !files.is_empty() && files.len() <= 4096,
+        "invalid payload count"
+    );
+    let mut paths = BTreeSet::new();
+    let mut total = 0u64;
+    for file in files {
         ensure!(
-            path != Path::new("/"),
-            "release root cannot be filesystem root"
+            file.size <= 512 * 1024 * 1024,
+            "payload file exceeds size bound"
+        );
+        total = total
+            .checked_add(file.size)
+            .context("payload size overflow")?;
+        ensure!(
+            total <= 2 * 1024 * 1024 * 1024,
+            "payload exceeds total size bound"
+        );
+        payload_path(&file.path)?;
+        mode(file)?;
+        super::validate_digest(&file.sha256)?;
+        ensure!(paths.insert(&file.path), "duplicate payload path");
+    }
+    for file in files {
+        ensure!(
+            !paths
+                .iter()
+                .any(|other| *other != &file.path && file.path.starts_with(other)),
+            "payload file and directory overlap"
         );
     }
-    let parent = native
-        .current_link
-        .parent()
-        .context("current link has no parent")?;
-    snapshot::require_path(parent)?;
+    Ok(())
+}
+fn validate_manifest(manifest: &PackageManifest) -> anyhow::Result<()> {
     ensure!(
-        native.current_link.is_absolute(),
-        "current link must be absolute"
+        manifest.manifest_version == 1,
+        "unsupported package contract"
     );
-    let name = native
-        .current_link
+    manifest.identity.validate()?;
+    let version = manifest.identity.version.split('.').collect::<Vec<_>>();
+    ensure!(
+        version.len() == 3
+            && version.iter().all(|part| !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (*part == "0" || !part.starts_with('0'))),
+        "release version must be canonical major.minor.patch"
+    );
+    manifest.schema_identity.validate()?;
+    ensure!(
+        manifest.schema_identity.schema_revision < (1u64 << 53),
+        "schema revision exceeds wire bound"
+    );
+    ensure!(
+        manifest.schema_identity.application == manifest.identity.product,
+        "schema product differs"
+    );
+    ensure!(
+        matches!(
+            manifest.identity.product.as_str(),
+            "xcos" | "xczs" | "xocs" | "xscs" | "xsos" | "xszs"
+        ),
+        "unsupported server product"
+    );
+    ensure!(
+        manifest.server == Path::new("bin").join(&manifest.identity.product)
+            && manifest.setup == Path::new("libexec/setup"),
+        "uncontrolled executable layout"
+    );
+    validate_files(&manifest.files)?;
+    for path in [&manifest.server, &manifest.setup] {
+        ensure!(
+            manifest
+                .files
+                .iter()
+                .any(|file| &file.path == path && file.mode == "0755"),
+            "verified executable absent"
+        );
+    }
+    ensure!(
+        !manifest.services.is_empty() && manifest.services.len() <= 2,
+        "invalid writer count"
+    );
+    let mut roles = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for service in &manifest.services {
+        ensure!(
+            (service.role == "server"
+                && service.name == format!("{}.service", manifest.identity.product))
+                || (manifest.identity.product == "xcos"
+                    && service.role == "media"
+                    && service.name == "xcos-mediamtx.service"),
+            "uncontrolled package writer"
+        );
+        super::validate_service(&service.name)?;
+        super::validate_service_role(&service.role)?;
+        ensure!(
+            roles.insert(&service.role) && names.insert(&service.name),
+            "duplicate package writer"
+        );
+        ensure!(
+            service.path == Path::new("share/systemd").join(&service.name)
+                && manifest.files.iter().any(|file| file.path == service.path),
+            "writer template absent from verified payload"
+        );
+    }
+    ensure!(
+        manifest
+            .services
+            .iter()
+            .filter(|service| service.role == "server")
+            .count()
+            == 1,
+        "main writer absent"
+    );
+    Ok(())
+}
+pub(super) fn validate_plan(plan: &UpgradePlan) -> anyhow::Result<()> {
+    let native = plan
+        .native_release
+        .as_ref()
+        .context("fixed-root package plan required")?;
+    snapshot::require_path(&native.root)?;
+    ensure!(
+        native.root != Path::new("/"),
+        "installation root cannot be filesystem root"
+    );
+    ensure!(
+        native.source_manifest == native.root.join("share/package.json")
+            && plan.config == native.root.join("config/config.json"),
+        "nonstandard fixed-root paths"
+    );
+    snapshot::require_path(&plan.installed_binary)?;
+    ensure!(
+        plan.installed_binary.parent() == Some(native.root.join("bin").as_path()),
+        "executable escaped ROOT/bin"
+    );
+    let operation = plan
+        .work_directory
         .file_name()
-        .context("current link has no name")?;
+        .and_then(|name| name.to_str())
+        .context("upgrade work directory needs an operation UUID")?;
+    let operation_id = uuid::Uuid::parse_str(operation)?;
     ensure!(
-        name == "current",
-        "the deployment selector must be named current"
+        operation_id.get_version_num() == 4
+            && operation_id.to_string() == operation
+            && plan.work_directory.parent()
+                == Some(native.root.join("maintenance/upgrades").as_path()),
+        "recovery must be ROOT/maintenance/upgrades/canonical-v4-UUID"
     );
     ensure!(
-        native.source_root.parent() == Some(parent.join("releases").as_path())
-            && native.install_root.parent() == native.source_root.parent(),
-        "selector may only choose its physical releases children"
+        !plan.target_binary.starts_with(native.root.join("bin"))
+            && plan.target_binary != plan.installed_binary,
+        "target overlaps installed payload"
     );
-    ensure!(
-        native.source_root != native.install_root
-            && !native.source_root.starts_with(&native.install_root)
-            && !native.install_root.starts_with(&native.source_root),
-        "source and target immutable roots overlap"
-    );
-    ensure!(
-        plan.installed_binary.starts_with(&native.current_link)
-            && plan.installed_binary != native.current_link,
-        "installed binary must use the controlled current selector"
-    );
-    relative(plan.installed_binary.strip_prefix(&native.current_link)?)?;
-    for root in [
-        &native.source_root,
-        &native.install_root,
-        &native.current_link,
-    ] {
-        for resource in &plan.resources {
+    for resource in &plan.resources {
+        ensure!(
+            resource.path != native.root && !native.root.starts_with(&resource.path),
+            "state root contains installation"
+        );
+        for name in ["bin", "libexec", "share", "maintenance", "run"] {
+            let reserved = native.root.join(name);
             ensure!(
-                !root.starts_with(&resource.path) && !resource.path.starts_with(root),
-                "release and persistent state overlap"
+                !resource.path.starts_with(&reserved) && !reserved.starts_with(&resource.path),
+                "state and controlled installation paths overlap"
             );
         }
-        ensure!(
-            !root.starts_with(&plan.work_directory) && !plan.work_directory.starts_with(root),
-            "release and recovery roots overlap"
-        );
     }
     Ok(())
 }
+fn root(plan: &UpgradePlan) -> anyhow::Result<&Path> {
+    Ok(&plan
+        .native_release
+        .as_ref()
+        .context("fixed-root plan required")?
+        .root)
+}
+fn controlled_directory(path: &Path) -> anyhow::Result<fs::Metadata> {
+    snapshot::require_path(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && metadata.mode() & 0o7022 == 0,
+        "payload directory must be administrator controlled"
+    );
+    Ok(metadata)
+}
+pub(super) fn installed_binary(plan: &UpgradePlan) -> anyhow::Result<PathBuf> {
+    validate_plan(plan)?;
+    Ok(plan.installed_binary.clone())
+}
+fn input_root(plan: &UpgradePlan, artifact: &ReleaseArtifact) -> anyhow::Result<PathBuf> {
+    let mut directory = plan.target_binary.clone();
+    for _ in artifact.entrypoint.components() {
+        ensure!(directory.pop(), "target has no payload root");
+    }
+    ensure!(
+        directory.join(&artifact.entrypoint) == plan.target_binary,
+        "target differs from verified executable"
+    );
+    snapshot::require_path(&directory)?;
+    ensure!(
+        plan.release_manifest == directory.join("share/package.json")
+            && plan.release_checksum == directory.join("share/package.sha256"),
+        "metadata escaped target payload"
+    );
+    Ok(directory)
+}
+pub(super) fn verify_checksum(raw: &[u8], checksum: &[u8]) -> anyhow::Result<()> {
+    let expected = format!("{}\n", super::digest_hex(Sha256::digest(raw)));
+    ensure!(
+        checksum == expected.as_bytes(),
+        "package manifest SHA-256 mismatch"
+    );
+    Ok(())
+}
+fn source_manifest_verified(plan: &UpgradePlan) -> anyhow::Result<PackageManifest> {
+    let native = plan
+        .native_release
+        .as_ref()
+        .context("fixed-root plan required")?;
+    controlled_directory(&native.root)?;
+    let raw = snapshot::read_bounded(&native.source_manifest, super::MAX_JSON)?;
+    verify_checksum(
+        &raw,
+        &snapshot::read_bounded(&native.root.join("share/package.sha256"), 65)?,
+    )?;
+    let manifest: PackageManifest = serde_json::from_slice(&raw)?;
+    validate_manifest(&manifest)?;
+    ensure!(
+        native.root.join(&manifest.server) == plan.installed_binary,
+        "installed path differs from source authority"
+    );
+    payload_entries(&native.root, &manifest.files, plan.max_backup_bytes)?;
+    Ok(manifest)
+}
 
+pub(super) fn current_package(plan: &UpgradePlan) -> anyhow::Result<PackageManifest> {
+    source_manifest_verified(plan)
+}
+pub(super) fn package_to_release(plan: &UpgradePlan, raw: &[u8]) -> anyhow::Result<UpgradeRelease> {
+    let target: PackageManifest = serde_json::from_slice(raw)?;
+    validate_manifest(&target)?;
+    let source = source_manifest_verified(plan)?;
+    ensure!(
+        source.services == target.services,
+        "upgrade cannot silently change state writers"
+    );
+    ensure!(
+        source
+            .services
+            .iter()
+            .any(|service| service.role == "server" && service.name == plan.service),
+        "main service differs from verified mapping"
+    );
+    let mut roles = source
+        .services
+        .iter()
+        .filter(|service| service.role != "server")
+        .map(|service| service.role.clone())
+        .collect::<Vec<_>>();
+    roles.sort();
+    for service in &source.services {
+        if service.role != "server" {
+            ensure!(
+                plan.additional_services
+                    .iter()
+                    .any(|writer| writer.role == service.role && writer.service == service.name),
+                "additional writer differs from verified mapping"
+            );
+        }
+    }
+    for service in &source.services {
+        let old = source
+            .files
+            .iter()
+            .find(|file| file.path == service.path)
+            .context("source unit missing")?;
+        let new = target
+            .files
+            .iter()
+            .find(|file| file.path == service.path)
+            .context("target unit missing")?;
+        ensure!(
+            old == new,
+            "service template changes require an explicit installation contract update"
+        );
+    }
+    let binary_sha256 = target
+        .files
+        .iter()
+        .find(|file| file.path == target.server)
+        .context("checksummed server absent")?
+        .sha256
+        .clone();
+    let artifact = ReleaseArtifact {
+        protocol: "fixed-root-payload-v1".into(),
+        entrypoint: target.server,
+        setup: target.setup,
+        tree_sha256: payload_digest(&target.files)?,
+        files: target.files,
+    };
+    Ok(UpgradeRelease {
+        manifest_version: 1,
+        identity: target.identity,
+        source_identity: source.identity,
+        binary_sha256,
+        source_schema: source.schema_identity,
+        target_schema: target.schema_identity,
+        artifact: Some(artifact),
+        resources: plan
+            .resources
+            .iter()
+            .map(|resource| ReleaseResource {
+                name: resource.name.clone(),
+                kind: resource.kind,
+            })
+            .collect(),
+        additional_service_roles: roles,
+    })
+}
+fn payload_digest(files: &[PayloadFile]) -> anyhow::Result<String> {
+    let mut sorted = files.to_vec();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut digest = Sha256::new();
+    digest.update(b"fixed-root-payload-v1\n");
+    digest.update(serde_json::to_vec(&sorted)?);
+    Ok(super::digest_hex(digest.finalize()))
+}
 pub(super) fn validate_artifact(
     plan: &UpgradePlan,
     release: &UpgradeRelease,
 ) -> anyhow::Result<()> {
-    match (&plan.native_release, &release.artifact) {
-        (None, None) => return Ok(()),
-        (Some(_), Some(_)) => {}
-        _ => anyhow::bail!("deployment plan and signed artifact disagree"),
-    }
-    let native = plan.native_release.as_ref().unwrap();
-    let artifact = release.artifact.as_ref().unwrap();
+    validate_plan(plan)?;
+    let artifact = release
+        .artifact
+        .as_ref()
+        .context("checksummed fixed-root payload required")?;
     ensure!(
-        native
-            .source_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some(release.source_identity.version.as_str()),
-        "original release root does not name its signed current software version"
+        artifact.protocol == "fixed-root-payload-v1"
+            && artifact.entrypoint == Path::new("bin").join(&release.identity.product)
+            && artifact.setup == Path::new("libexec/setup"),
+        "unsupported payload layout"
     );
     ensure!(
-        artifact.protocol == "immutable-release-root-v1",
-        "unsupported release artifact protocol"
+        root(plan)?.join(&artifact.entrypoint) == plan.installed_binary,
+        "source and target executable layout differs"
     );
-    relative(&artifact.root_layout)?;
-    relative(&artifact.entrypoint)?;
-    if let Some(name) = &artifact.diagnostic_release_root_env {
-        validate_diagnostic_environment(name)?;
-    }
-    super::validate_digest(&artifact.tree_sha256)?;
+    validate_files(&artifact.files)?;
     ensure!(
         artifact
-            .root_layout
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some(release.identity.version.as_str()),
-        "release layout must name its exact software version"
+            .files
+            .iter()
+            .any(|file| file.path == artifact.entrypoint
+                && file.mode == "0755"
+                && file.sha256 == release.binary_sha256)
+            && artifact
+                .files
+                .iter()
+                .any(|file| file.path == artifact.setup && file.mode == "0755"),
+        "verified executables missing"
     );
     ensure!(
-        native.install_root.ends_with(&artifact.root_layout),
-        "installation does not preserve the product physical layout"
+        payload_digest(&artifact.files)? == artifact.tree_sha256,
+        "verified payload digest differs"
     );
-    ensure!(
-        plan.installed_binary == native.current_link.join(&artifact.entrypoint),
-        "selector entrypoint differs from signed authority"
-    );
-    let input = input_root(plan, artifact)?;
-    ensure!(
-        input.ends_with(&artifact.root_layout),
-        "input does not preserve the product physical layout"
-    );
-    for resource in &plan.resources {
-        ensure!(
-            !input.starts_with(&resource.path) && !resource.path.starts_with(&input),
-            "input release and persistent state overlap"
-        );
-    }
-    ensure!(
-        !input.starts_with(&plan.work_directory) && !plan.work_directory.starts_with(&input),
-        "input and recovery roots overlap"
-    );
+    input_root(plan, artifact)?;
     Ok(())
 }
 
-fn input_root(plan: &UpgradePlan, artifact: &ReleaseArtifact) -> anyhow::Result<PathBuf> {
-    let count = artifact.entrypoint.components().count();
-    let mut root = plan.target_binary.clone();
-    for _ in 0..count {
-        ensure!(root.pop(), "target entrypoint has no root");
-    }
-    ensure!(
-        root.join(&artifact.entrypoint) == plan.target_binary,
-        "target entrypoint differs from signed authority"
-    );
-    snapshot::require_path(&root)?;
-    Ok(root)
-}
-
-fn immutable_entries(root: &Path, limit: u64) -> anyhow::Result<Vec<Entry>> {
-    let owner_uid = fs::symlink_metadata(root)?.uid();
-    let caller_uid = rustix::process::geteuid().as_raw();
-    ensure!(
-        owner_uid == 0 || owner_uid == caller_uid || caller_uid == 0,
-        "immutable release belongs to another user"
-    );
-    let entries = snapshot::inventory_owned(root, true, limit, false, owner_uid)?;
-    ensure!(
-        entries.iter().all(|entry| entry.mode & 0o022 == 0),
-        "release tree cannot be writable by its service or other users"
-    );
-    for entry in &entries {
-        let path = if entry.path.as_os_str().is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(&entry.path)
-        };
+fn payload_entries(
+    directory: &Path,
+    files: &[PayloadFile],
+    budget: u64,
+) -> anyhow::Result<Vec<Entry>> {
+    let mut paths: BTreeMap<PathBuf, Option<&PayloadFile>> = BTreeMap::new();
+    paths.insert(PathBuf::new(), None);
+    for file in files {
+        relative(&file.path)?;
+        let mut parent = file.path.parent();
+        while let Some(path) = parent {
+            if path.as_os_str().is_empty() {
+                break;
+            }
+            paths.entry(path.to_owned()).or_insert(None);
+            parent = path.parent();
+        }
         ensure!(
-            fs::symlink_metadata(path)?.mode() & 0o7000 == 0,
-            "release tree contains special permission bits"
+            paths.insert(file.path.clone(), Some(file)).is_none(),
+            "payload paths overlap"
         );
+    }
+    let mut total = 0u64;
+    let mut entries = Vec::with_capacity(paths.len());
+    for (relative, authority) in paths {
+        let path = if relative.as_os_str().is_empty() {
+            directory.to_path_buf()
+        } else {
+            directory.join(&relative)
+        };
+        if let Some(file) = authority {
+            let held = snapshot::open_regular(&path)?;
+            let metadata = held.metadata()?;
+            let permissions = mode(file)?;
+            ensure!(
+                metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.mode() & 0o7777 == permissions
+                    && metadata.len() == file.size,
+                "payload ownership, size or mode differs"
+            );
+            total = total
+                .checked_add(file.size)
+                .context("payload size overflow")?;
+            ensure!(
+                total <= budget && snapshot::digest_file(&path)? == file.sha256,
+                "payload budget or checksum differs"
+            );
+            entries.push(Entry {
+                path: relative,
+                directory: false,
+                mode: permissions,
+                bytes: file.size,
+                sha256: file.sha256.clone(),
+            });
+        } else {
+            let metadata = controlled_directory(&path)?;
+            ensure!(
+                metadata.mode() & 0o777 == 0o755,
+                "payload directories require 0755"
+            );
+            entries.push(Entry {
+                path: relative,
+                directory: true,
+                mode: 0o755,
+                bytes: 0,
+                sha256: String::new(),
+            });
+        }
     }
     Ok(entries)
 }
-
-/// Exact preorder inventory, sorted siblings, UTF-8 paths, and explicit empty
-/// root path. JSON field order is path,directory,mode,bytes,sha256. Packaging
-/// implements this same byte contract, including the domain separator.
-pub(super) fn tree_digest(entries: &[Entry]) -> anyhow::Result<String> {
-    let mut digest = Sha256::new();
-    digest.update(b"immutable-release-root-v1\n");
-    digest.update(serde_json::to_vec(entries)?);
-    Ok(super::digest_hex(digest.finalize()))
+fn metadata_files(directory: &Path, files: &[PayloadFile]) -> anyhow::Result<Vec<PayloadFile>> {
+    let mut output = files.to_vec();
+    for name in ["share/package.json", "share/package.sha256"] {
+        let path = directory.join(name);
+        let metadata = snapshot::open_regular(&path)?.metadata()?;
+        ensure!(
+            metadata.mode() & 0o7777 == 0o644,
+            "package metadata requires 0644"
+        );
+        output.push(PayloadFile {
+            path: PathBuf::from(name),
+            mode: "0644".into(),
+            size: metadata.len(),
+            sha256: snapshot::digest_file(&path)?,
+        });
+    }
+    Ok(output)
 }
-
-fn current_parent(plan: &UpgradePlan) -> anyhow::Result<fs::Metadata> {
-    let native = plan
-        .native_release
-        .as_ref()
-        .context("native deployment missing")?;
-    let parent = native
-        .current_link
-        .parent()
-        .context("current parent missing")?;
-    snapshot::require_path(parent)?;
-    let metadata = fs::symlink_metadata(parent)?;
+fn files_from_entries(entries: &[Entry]) -> Vec<PayloadFile> {
+    entries
+        .iter()
+        .filter(|entry| !entry.directory)
+        .map(|entry| PayloadFile {
+            path: entry.path.clone(),
+            mode: format!("{:04o}", entry.mode),
+            size: entry.bytes,
+            sha256: entry.sha256.clone(),
+        })
+        .collect()
+}
+fn verify_inventory(directory: &Path, entries: &[Entry], budget: u64) -> anyhow::Result<()> {
     ensure!(
-        metadata.is_dir()
-            && (metadata.uid() == 0 || metadata.uid() == rustix::process::geteuid().as_raw())
-            && metadata.mode() & 0o7777 == 0o755,
-        "current parent must be a physical owned 0755 directory"
+        payload_entries(directory, &files_from_entries(entries), budget)? == entries,
+        "payload inventory changed"
     );
-    let releases = native
-        .source_root
-        .parent()
-        .context("release parent missing")?;
-    snapshot::require_path(releases)?;
-    let release_parent = fs::symlink_metadata(releases)?;
-    ensure!(
-        release_parent.is_dir()
-            && release_parent.uid() == metadata.uid()
-            && release_parent.mode() & 0o7777 == 0o755,
-        "releases parent must be physical 0755 with the selector parent's owner"
-    );
-    Ok(metadata)
+    Ok(())
 }
-
-fn current_root(plan: &UpgradePlan) -> anyhow::Result<PathBuf> {
-    let native = plan
-        .native_release
-        .as_ref()
-        .context("native deployment missing")?;
-    let parent = current_parent(plan)?;
-    let metadata = fs::symlink_metadata(&native.current_link)?;
-    ensure!(
-        metadata.file_type().is_symlink() && metadata.uid() == parent.uid(),
-        "current must be an owned symbolic link"
-    );
-    let target = fs::read_link(&native.current_link)?;
-    ensure!(
-        target.as_os_str() == native.source_root.as_os_str()
-            || target.as_os_str() == native.install_root.as_os_str(),
-        "current points to an unknown release"
-    );
-    snapshot::require_path(&target)?;
-    Ok(target)
-}
-
-pub(super) fn installed_binary(plan: &UpgradePlan) -> anyhow::Result<PathBuf> {
-    let Some(native) = &plan.native_release else {
-        return Ok(plan.installed_binary.clone());
-    };
-    let entrypoint = plan.installed_binary.strip_prefix(&native.current_link)?;
-    Ok(current_root(plan)?.join(entrypoint))
-}
-
-pub(super) fn program_status(journal: &UpgradeJournal) -> anyhow::Result<&'static str> {
-    verify_parent(journal)?;
-    let native = journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?;
-    let backup = journal
-        .native_backup
-        .as_ref()
-        .context("native backup missing")?;
-    let root = current_root(&journal.plan)?;
-    let actual = immutable_entries(&root, journal.plan.max_backup_bytes)?;
-    Ok(
-        if root == native.source_root && actual == backup.source_entries {
-            "original"
-        } else if root == native.install_root && actual == backup.target_entries {
-            "target"
-        } else {
-            "unknown"
-        },
-    )
-}
-
-pub(super) fn coordinate(plan: &UpgradePlan) -> anyhow::Result<Option<MaintenanceLock>> {
-    let Some(native) = &plan.native_release else {
-        return Ok(None);
-    };
-    current_parent(plan)?;
-    let directory = PrivateStateDirectory::create(
-        native
-            .current_link
-            .parent()
-            .unwrap()
-            .join(".release-upgrade"),
-    )?;
-    Ok(Some(directory.try_maintenance_lock()?))
-}
-
 pub(super) fn verify_input(plan: &UpgradePlan, release: &UpgradeRelease) -> anyhow::Result<()> {
     validate_artifact(plan, release)?;
-    let Some(artifact) = &release.artifact else {
-        return Ok(());
-    };
-    let entries = immutable_entries(&input_root(plan, artifact)?, plan.max_backup_bytes)?;
+    let artifact = release.artifact.as_ref().unwrap();
+    let directory = input_root(plan, artifact)?;
+    let expected = payload_entries(
+        &directory,
+        &metadata_files(&directory, &artifact.files)?,
+        plan.max_backup_bytes,
+    )?;
+    let actual = snapshot::inventory_owned(
+        &directory,
+        true,
+        plan.max_backup_bytes,
+        false,
+        rustix::process::geteuid().as_raw(),
+    )?;
     ensure!(
-        tree_digest(&entries)? == artifact.tree_sha256,
-        "complete target release checksum differs"
+        actual == expected,
+        "undeclared files or directories in target payload"
     );
     Ok(())
 }
 
-pub(super) fn staged_root(journal: &UpgradeJournal) -> anyhow::Result<PathBuf> {
-    Ok(super::execution::root(journal)?
-        .join("target-release")
-        .join(
-            &journal
-                .release
-                .artifact
-                .as_ref()
-                .context("artifact missing")?
-                .root_layout,
-        ))
+/// A script passes its held tool.lock through an explicit inherited descriptor.
+/// Only the independently opened named inode is accepted. Drop closes the duplicate without unlocking the
+/// parent's shared open file description.
+pub(super) struct ToolLock {
+    _file: File,
 }
-
-pub(super) fn staged_binary(journal: &UpgradeJournal) -> anyhow::Result<PathBuf> {
-    if let Some(artifact) = &journal.release.artifact {
-        Ok(staged_root(journal)?.join(&artifact.entrypoint))
-    } else {
-        Ok(super::execution::root(journal)?.join("target-binary"))
+impl ToolLock {
+    /// A child can inherit a duplicate of this open file description without
+    /// releasing the coordinator lock held for the whole transaction.
+    pub(super) fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        self._file.as_fd()
     }
 }
-
+pub(super) fn coordinate(
+    plan: &UpgradePlan,
+    inherited: Option<std::os::fd::BorrowedFd<'_>>,
+) -> anyhow::Result<Option<ToolLock>> {
+    Ok(Some(coordinate_root(root(plan)?, inherited)?))
+}
+pub(super) fn coordinate_root(
+    root: &Path,
+    inherited: Option<std::os::fd::BorrowedFd<'_>>,
+) -> anyhow::Result<ToolLock> {
+    ensure!(
+        rustix::process::geteuid().as_raw() == 0,
+        "installation coordination requires root"
+    );
+    super::execution::require_trusted(root)?;
+    let directory = root.join("maintenance");
+    let metadata = controlled_directory(&directory)?;
+    ensure!(
+        metadata.mode() & 0o7777 == 0o700,
+        "maintenance requires 0700"
+    );
+    let path = directory.join("tool.lock");
+    let named = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&path)?;
+    let metadata = named.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && metadata.mode() & 0o7777 == 0o600,
+        "unsafe tool coordinator lock"
+    );
+    let file = match inherited {
+        Some(descriptor) => {
+            let held = rustix::fs::fstat(descriptor)?;
+            ensure!(
+                held.st_dev == metadata.dev()
+                    && held.st_ino == metadata.ino()
+                    && held.st_uid == metadata.uid()
+                    && held.st_nlink == 1
+                    && held.st_mode & 0o7777 == 0o600,
+                "inherited coordinator descriptor differs from the controlled lock"
+            );
+            File::from(rustix::io::dup(descriptor)?)
+        }
+        None => named,
+    };
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    let current = fs::symlink_metadata(&path)?;
+    ensure!(
+        current.dev() == metadata.dev() && current.ino() == metadata.ino(),
+        "coordinator lock changed"
+    );
+    Ok(ToolLock { _file: file })
+}
+pub(super) fn staged_root(journal: &UpgradeJournal) -> anyhow::Result<PathBuf> {
+    Ok(super::execution::root(journal)?.join("target-payload"))
+}
+pub(super) fn staged_binary(journal: &UpgradeJournal) -> anyhow::Result<PathBuf> {
+    Ok(staged_root(journal)?.join(
+        &journal
+            .release
+            .artifact
+            .as_ref()
+            .context("payload required")?
+            .entrypoint,
+    ))
+}
 pub(super) fn seal(journal: &mut UpgradeJournal) -> anyhow::Result<()> {
-    let native = journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?;
+    let source = source_manifest_verified(&journal.plan)?;
     let artifact = journal
         .release
         .artifact
         .as_ref()
-        .context("artifact missing")?;
-    ensure!(
-        current_root(&journal.plan)? == native.source_root,
-        "current no longer selects original release"
-    );
-    let parent = current_parent(&journal.plan)?;
-    let source_metadata = fs::symlink_metadata(&native.source_root)?;
-    let source_entries = immutable_entries(&native.source_root, journal.plan.max_backup_bytes)?;
-    let target_entries = immutable_entries(
-        &input_root(&journal.plan, artifact)?,
+        .context("payload required")?;
+    let source_root = root(&journal.plan)?;
+    let source_entries = payload_entries(
+        source_root,
+        &metadata_files(source_root, &source.files)?,
         journal.plan.max_backup_bytes,
     )?;
-    ensure!(
-        tree_digest(&target_entries)? == artifact.tree_sha256,
-        "target changed before sealing"
-    );
-    if snapshot::named_exists(&native.install_root)? {
-        ensure!(
-            immutable_entries(&native.install_root, journal.plan.max_backup_bytes)?
-                == target_entries,
-            "target installation already contains different data"
-        );
-    }
-    let staged = staged_root(journal)?;
-    create_parents(staged.parent().unwrap(), &super::execution::root(journal)?)?;
-    snapshot::snapshot(
-        &input_root(&journal.plan, artifact)?,
-        &staged,
-        &target_entries,
+    let input = input_root(&journal.plan, artifact)?;
+    verify_input(&journal.plan, &journal.release)?;
+    let target_entries = payload_entries(
+        &input,
+        &metadata_files(&input, &artifact.files)?,
+        journal.plan.max_backup_bytes,
     )?;
-    ensure!(
-        immutable_entries(&staged, journal.plan.max_backup_bytes)? == target_entries,
-        "sealed release changed"
-    );
+    let metadata = controlled_directory(source_root)?;
+    let staged = staged_root(journal)?;
+    snapshot::snapshot_recorded(&input, &staged, &target_entries, |directory, metadata| {
+        super::execution::record_payload_stage(journal, directory, metadata)
+    })?;
+    verify_inventory(&staged, &target_entries, journal.plan.max_backup_bytes)?;
     journal.native_backup = Some(NativeBackup {
         source_entries,
         target_entries,
-        current_parent_device: parent.dev(),
-        current_parent_inode: parent.ino(),
-        source_directory_device: source_metadata.dev(),
-        source_directory_inode: source_metadata.ino(),
+        root_device: metadata.dev(),
+        root_inode: metadata.ino(),
         source_recovery_started: false,
     });
     Ok(())
 }
-
-fn create_parents(path: &Path, boundary: &Path) -> anyhow::Result<()> {
-    ensure!(
-        path.starts_with(boundary),
-        "staging parent escaped recovery root"
-    );
-    if path == boundary {
-        return Ok(());
-    }
-    create_parents(path.parent().context("staging parent missing")?, boundary)?;
-    if !snapshot::named_exists(path)? {
-        fs::create_dir(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
-        snapshot::sync_parent(path)?;
-    }
-    snapshot::require_path(path)
-}
-
 fn verify_parent(journal: &UpgradeJournal) -> anyhow::Result<()> {
     let backup = journal
         .native_backup
         .as_ref()
-        .context("native backup missing")?;
-    let parent = current_parent(&journal.plan)?;
+        .context("payload backup missing")?;
+    let metadata = controlled_directory(root(&journal.plan)?)?;
     ensure!(
-        parent.dev() == backup.current_parent_device && parent.ino() == backup.current_parent_inode,
-        "deployment parent identity changed"
+        metadata.dev() == backup.root_device && metadata.ino() == backup.root_inode,
+        "installation root identity changed"
     );
     Ok(())
 }
-
 pub(super) fn backup_original(journal: &UpgradeJournal) -> anyhow::Result<u64> {
-    let native = journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?;
+    verify_parent(journal)?;
     let backup = journal
         .native_backup
         .as_ref()
-        .context("native backup missing")?;
-    ensure!(
-        immutable_entries(&native.source_root, journal.plan.max_backup_bytes)?
-            == backup.source_entries,
-        "original complete release changed"
-    );
+        .context("payload backup missing")?;
+    verify_inventory(
+        root(&journal.plan)?,
+        &backup.source_entries,
+        journal.plan.max_backup_bytes,
+    )?;
     snapshot::snapshot(
-        &native.source_root,
-        &journal.plan.work_directory.join("original-release"),
+        root(&journal.plan)?,
+        &journal.plan.work_directory.join("original-payload"),
         &backup.source_entries,
     )?;
-    let bytes = backup
-        .source_entries
-        .iter()
-        .try_fold(0u64, |total, entry| {
-            total
-                .checked_add(entry.bytes)
-                .context("release size overflow")
-        })?;
     verify_original_backup(journal)?;
-    Ok(bytes)
+    backup.source_entries.iter().try_fold(0u64, |total, entry| {
+        total
+            .checked_add(entry.bytes)
+            .context("payload size overflow")
+    })
 }
-
 pub(super) fn verify_original_backup(journal: &UpgradeJournal) -> anyhow::Result<()> {
-    let Some(backup) = &journal.native_backup else {
-        return Ok(());
-    };
-    ensure!(
-        immutable_entries(
-            &journal.plan.work_directory.join("original-release"),
-            journal.plan.max_backup_bytes
-        )? == backup.source_entries,
-        "original complete release backup changed"
-    );
-    Ok(())
+    let backup = journal
+        .native_backup
+        .as_ref()
+        .context("payload backup missing")?;
+    verify_parent(journal)?;
+    verify_inventory(
+        &journal.plan.work_directory.join("original-payload"),
+        &backup.source_entries,
+        journal.plan.max_backup_bytes,
+    )
 }
-
 pub(super) fn verify_sealed(journal: &UpgradeJournal) -> anyhow::Result<()> {
-    let Some(backup) = &journal.native_backup else {
-        return Ok(());
-    };
-    ensure!(
-        immutable_entries(&staged_root(journal)?, journal.plan.max_backup_bytes)?
-            == backup.target_entries,
-        "sealed complete release changed"
-    );
-    ensure!(
-        tree_digest(&backup.target_entries)?
-            == journal
-                .release
-                .artifact
-                .as_ref()
-                .context("artifact missing")?
-                .tree_sha256,
-        "signed complete release digest changed"
-    );
+    let backup = journal
+        .native_backup
+        .as_ref()
+        .context("payload backup missing")?;
+    verify_parent(journal)?;
+    verify_inventory(
+        &staged_root(journal)?,
+        &backup.target_entries,
+        journal.plan.max_backup_bytes,
+    )
+}
+fn prepare_parent(path: &Path, boundary: &Path) -> anyhow::Result<()> {
+    ensure!(path.starts_with(boundary), "payload parent escaped ROOT");
+    if path != boundary {
+        prepare_parent(path.parent().context("payload parent missing")?, boundary)?;
+        if !snapshot::named_exists(path)? {
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+            snapshot::sync_parent(path)?;
+        }
+    }
+    controlled_directory(path)?;
+    Ok(())
+}
+fn known_live(directory: &Path, source: &[Entry], target: &[Entry]) -> anyhow::Result<()> {
+    let paths = source
+        .iter()
+        .chain(target)
+        .filter(|entry| !entry.directory)
+        .map(|entry| &entry.path)
+        .collect::<BTreeSet<_>>();
+    for path in paths {
+        let named = directory.join(path);
+        if !snapshot::named_exists(&named)? {
+            continue;
+        }
+        let metadata = snapshot::open_regular(&named)?.metadata()?;
+        let digest = snapshot::digest_file(&named)?;
+        ensure!(
+            metadata.uid() == rustix::process::geteuid().as_raw()
+                && source.iter().chain(target).any(|entry| entry.path == *path
+                    && !entry.directory
+                    && entry.sha256 == digest
+                    && entry.mode == metadata.mode() & 0o7777
+                    && entry.bytes == metadata.len()),
+            "unknown installed payload; refusing replacement"
+        );
+    }
+    Ok(())
+}
+fn replace_payload(
+    source_root: &Path,
+    installed: &Path,
+    wanted: &[Entry],
+    obsolete: &[Entry],
+) -> anyhow::Result<()> {
+    known_live(installed, wanted, obsolete)?;
+    for entry in wanted.iter().filter(|entry| !entry.directory) {
+        let destination = installed.join(&entry.path);
+        prepare_parent(destination.parent().unwrap(), installed)?;
+        replace_file(
+            &source_root.join(&entry.path),
+            &destination,
+            &entry.sha256,
+            entry.mode,
+        )?;
+    }
+    let wanted_paths = wanted
+        .iter()
+        .map(|entry| &entry.path)
+        .collect::<BTreeSet<_>>();
+    for entry in obsolete
+        .iter()
+        .rev()
+        .filter(|entry| !entry.directory && !wanted_paths.contains(&entry.path))
+    {
+        let path = installed.join(&entry.path);
+        if snapshot::named_exists(&path)? {
+            fs::remove_file(&path)?;
+            snapshot::sync_parent(&path)?;
+        }
+    }
     Ok(())
 }
 
-fn publish_directory(stage: &Path, target: &Path) -> anyhow::Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        stage,
-        rustix::fs::CWD,
-        target,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )?;
-    snapshot::sync_parent(target)
+fn replace_file(source: &Path, target: &Path, digest: &str, mode: u32) -> anyhow::Result<()> {
+    ensure!(
+        snapshot::digest_file(source)? == digest,
+        "sealed payload changed before replacement"
+    );
+    let temporary = target.with_file_name(format!(".upgrade-payload-{}", uuid::Uuid::new_v4()));
+    snapshot::copy_regular(source, &temporary, mode)?;
+    ensure!(
+        snapshot::digest_file(&temporary)? == digest,
+        "staged payload checksum differs"
+    );
+    fs::rename(&temporary, target)?;
+    snapshot::sync_parent(target)?;
+    ensure!(
+        snapshot::digest_file(target)? == digest,
+        "installed payload checksum differs"
+    );
+    Ok(())
 }
-
 pub(super) fn install_target(journal: &UpgradeJournal) -> anyhow::Result<()> {
     verify_parent(journal)?;
     verify_sealed(journal)?;
-    let native = journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?;
     let backup = journal
         .native_backup
         .as_ref()
-        .context("native backup missing")?;
-    snapshot::require_path(native.install_root.parent().unwrap())?;
-    if !snapshot::named_exists(&native.install_root)? {
-        let stage = native
-            .install_root
-            .with_file_name(format!(".upgrade-release-{}", uuid::Uuid::new_v4()));
-        snapshot::snapshot(&staged_root(journal)?, &stage, &backup.target_entries)?;
-        ensure!(
-            immutable_entries(&stage, journal.plan.max_backup_bytes)? == backup.target_entries,
-            "new installation changed while copying"
-        );
-        publish_directory(&stage, &native.install_root)?;
-    }
-    ensure!(
-        immutable_entries(&native.install_root, journal.plan.max_backup_bytes)?
-            == backup.target_entries,
-        "target complete installation differs"
-    );
-    switch(journal, &native.install_root)
-}
-
-fn switch(journal: &UpgradeJournal, target: &Path) -> anyhow::Result<()> {
-    verify_parent(journal)?;
-    current_root(&journal.plan)?;
-    let native = journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?;
-    let stage = native
-        .current_link
-        .with_file_name(format!(".upgrade-current-{}", uuid::Uuid::new_v4()));
-    symlink(target, &stage)?;
-    fs::rename(&stage, &native.current_link)?;
-    snapshot::sync_parent(&native.current_link)?;
-    ensure!(
-        current_root(&journal.plan)? == target,
-        "release selector switch failed"
-    );
-    Ok(())
-}
-
-pub(super) fn original_needs_repair(journal: &UpgradeJournal) -> anyhow::Result<bool> {
-    let native = journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?;
-    let backup = journal
-        .native_backup
-        .as_ref()
-        .context("native backup missing")?;
-    Ok(
-        immutable_entries(&native.source_root, journal.plan.max_backup_bytes)
-            .ok()
-            .as_ref()
-            != Some(&backup.source_entries),
+        .context("payload backup missing")?;
+    replace_payload(
+        &staged_root(journal)?,
+        root(&journal.plan)?,
+        &backup.target_entries,
+        &backup.source_entries,
+    )?;
+    verify_inventory(
+        root(&journal.plan)?,
+        &backup.target_entries,
+        journal.plan.max_backup_bytes,
     )
 }
-
-fn displaced_root(journal: &UpgradeJournal) -> anyhow::Result<PathBuf> {
-    let root = &journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?
-        .source_root;
-    Ok(root.with_file_name(format!(
-        ".upgrade-displaced-original-{}",
-        journal.operation_id
-    )))
-}
-
-pub(super) fn permitted_missing_original(journal: &UpgradeJournal) -> anyhow::Result<bool> {
-    let Some(backup) = &journal.native_backup else {
-        return Ok(false);
-    };
-    if !backup.source_recovery_started {
-        return Ok(false);
-    }
-    let native = journal.plan.native_release.as_ref().unwrap();
-    if current_root(&journal.plan)? != native.source_root
-        || snapshot::named_exists(&native.source_root)?
-    {
-        return Ok(false);
-    }
-    let metadata = fs::symlink_metadata(displaced_root(journal)?)?;
-    Ok(metadata.is_dir()
-        && !metadata.file_type().is_symlink()
-        && metadata.dev() == backup.source_directory_device
-        && metadata.ino() == backup.source_directory_inode)
-}
-
-pub(super) fn restore_original(journal: &UpgradeJournal) -> anyhow::Result<()> {
+pub(super) fn original_needs_repair(journal: &UpgradeJournal) -> anyhow::Result<bool> {
     verify_parent(journal)?;
-    verify_original_backup(journal)?;
-    let native = journal
-        .plan
-        .native_release
-        .as_ref()
-        .context("native plan missing")?;
     let backup = journal
         .native_backup
         .as_ref()
-        .context("native backup missing")?;
-    if original_needs_repair(journal)? {
-        ensure!(
-            backup.source_recovery_started,
-            "original root repair intent was not persisted"
-        );
-        let displaced = displaced_root(journal)?;
-        if snapshot::named_exists(&native.source_root)? {
-            let metadata = fs::symlink_metadata(&native.source_root)?;
-            ensure!(
-                metadata.is_dir()
-                    && metadata.dev() == backup.source_directory_device
-                    && metadata.ino() == backup.source_directory_inode,
-                "original release directory was replaced; preserve unknown data"
-            );
-            publish_directory(&native.source_root, &displaced)?;
-        } else {
-            let metadata = fs::symlink_metadata(&displaced)?;
-            ensure!(
-                metadata.is_dir()
-                    && metadata.dev() == backup.source_directory_device
-                    && metadata.ino() == backup.source_directory_inode,
-                "original repair evidence differs"
-            );
-        }
-        let stage = native.source_root.with_file_name(format!(
-            ".upgrade-restored-original-{}",
-            uuid::Uuid::new_v4()
-        ));
-        snapshot::snapshot(
-            &journal.plan.work_directory.join("original-release"),
-            &stage,
-            &backup.source_entries,
-        )?;
-        ensure!(
-            immutable_entries(&stage, journal.plan.max_backup_bytes)? == backup.source_entries,
-            "restored complete release differs"
-        );
-        publish_directory(&stage, &native.source_root)?;
+        .context("payload backup missing")?;
+    Ok(verify_inventory(
+        root(&journal.plan)?,
+        &backup.source_entries,
+        journal.plan.max_backup_bytes,
+    )
+    .is_err())
+}
+pub(super) fn permitted_missing_original(journal: &UpgradeJournal) -> anyhow::Result<bool> {
+    verify_parent(journal)?;
+    let backup = journal
+        .native_backup
+        .as_ref()
+        .context("payload backup missing")?;
+    known_live(
+        root(&journal.plan)?,
+        &backup.source_entries,
+        &backup.target_entries,
+    )?;
+    Ok(matches!(
+        journal.phase,
+        super::UpgradePhase::SwitchIntent | super::UpgradePhase::RecoveryRestoring
+    ))
+}
+pub(super) fn restore_original(journal: &UpgradeJournal) -> anyhow::Result<()> {
+    verify_original_backup(journal)?;
+    let backup = journal
+        .native_backup
+        .as_ref()
+        .context("payload backup missing")?;
+    replace_payload(
+        &journal.plan.work_directory.join("original-payload"),
+        root(&journal.plan)?,
+        &backup.source_entries,
+        &backup.target_entries,
+    )?;
+    verify_inventory(
+        root(&journal.plan)?,
+        &backup.source_entries,
+        journal.plan.max_backup_bytes,
+    )
+}
+pub(super) fn program_status(journal: &UpgradeJournal) -> anyhow::Result<&'static str> {
+    verify_parent(journal)?;
+    let backup = journal
+        .native_backup
+        .as_ref()
+        .context("payload backup missing")?;
+    if verify_inventory(
+        root(&journal.plan)?,
+        &backup.source_entries,
+        journal.plan.max_backup_bytes,
+    )
+    .is_ok()
+    {
+        return Ok("original");
     }
-    ensure!(
-        immutable_entries(&native.source_root, journal.plan.max_backup_bytes)?
-            == backup.source_entries,
-        "original complete release differs"
-    );
-    switch(journal, &native.source_root)
+    if verify_inventory(
+        root(&journal.plan)?,
+        &backup.target_entries,
+        journal.plan.max_backup_bytes,
+    )
+    .is_ok()
+    {
+        return Ok("target");
+    }
+    known_live(
+        root(&journal.plan)?,
+        &backup.source_entries,
+        &backup.target_entries,
+    )?;
+    Ok("partial-switch")
 }

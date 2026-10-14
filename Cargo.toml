@@ -1,18 +1,18 @@
 [package]
 name = "xssc"
-version = "1.0.3"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.99"
 authors = ["sarmg <isarmg@163.com>"]
 license = "Apache-2.0"
-description = "Offline verified current-release upgrades and complete recovery for server and client products"
+description = "Fixed-root server upgrades and durable data recovery"
 publish = false
 
 [dependencies]
 libc = "0.2"
 anyhow = "1"
 clap = { version = "4.6.7", features = ["derive"] }
-xcsc = { git = "https://github.com/isarmg/xcsc.git", rev = "9cff5bc1425072533fcb8984ee4820b1f6ab6a5c", version = "=1.0.4", features = ["offline-maintenance"] }
+xcsc = { git = "https://github.com/isarmg/xcsc.git", rev = "6fca4299f5c34a79db1c7bd4e889b418d2a58e2d", version = "=1.0.0", features = ["offline-maintenance"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustix = { version = "1.1", features = ["fs", "process", "time"] }
