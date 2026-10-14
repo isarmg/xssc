@@ -703,6 +703,14 @@ pub fn read_plan(path: &Path) -> Result<UpgradePlan, UpgradeFailure> {
     })
 }
 
+fn readiness_address_allowed(address: SocketAddr, local: &[std::net::IpAddr]) -> bool {
+    let ip = address.ip().to_canonical();
+    address.port() > 0
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && (ip.is_loopback() || local.iter().any(|value| value.to_canonical() == ip))
+}
+
 fn validate_plan(plan: &UpgradePlan) -> anyhow::Result<()> {
     native_release::validate_plan(plan)?;
     ensure!(plan.plan_version == 1, "unsupported plan contract");
@@ -724,9 +732,16 @@ fn validate_plan(plan: &UpgradePlan) -> anyhow::Result<()> {
         plan.max_backup_bytes > 0,
         "backup byte limit must be positive"
     );
+    // Explicit interface binds are valid server configurations. Probe only this
+    // host, without silently redirecting a LAN-only listener to loopback.
+    let local = if plan.readiness_address.ip().to_canonical().is_loopback() {
+        Vec::new()
+    } else {
+        execution::local_ip_addresses()?
+    };
     ensure!(
-        plan.readiness_address.ip().is_loopback() && plan.readiness_address.port() > 0,
-        "readiness must use an explicit loopback address"
+        readiness_address_allowed(plan.readiness_address, &local),
+        "readiness must use a nonzero port on a local address"
     );
     ensure!(
         plan.additional_services.len() <= 16,

@@ -1,15 +1,16 @@
 # 原生边界审核
 
-工具自己的生产 Rust 中保留七处 `unsafe` 块，集中在两个平台边界模块。SQLx 当前数据测试使用 xcsc 的安全 SQLite 限制、防御模式及结构校验 API，不使用原始 SQLite 指针，也不实现第二个驱动。第三方及 xcsc 的边界由其对应源码和验收记录负责，不算作本仓库已逐项验证的代码。
+工具自己的生产 Rust 中保留九处 `unsafe` 块，集中在两个平台边界模块。SQLx 当前数据测试使用 xcsc 的安全 SQLite 限制、防御模式及结构校验 API，不使用原始 SQLite 指针，也不实现第二个驱动。第三方及 xcsc 的边界由其对应源码和验收记录负责，不算作本仓库已逐项验证的代码。
 
 | 位置 | 必要性与约束 | 安全替代及验证 |
 | --- | --- | --- |
 | `src/upgrade/execution.rs::account`，NSS 调用及初始化读取 | 按 systemd 普通 User 配置解析当前 uid/gid；CString、64 KiB 临时缓冲区和 `MaybeUninit` 输出在同步调用期间存活。只在返回成功且返回指针精确等于给定输出地址后读取整数字段。 | std 没有 NSS 账户解析 API；不增加 shell、无界命令输出或额外账户解析驱动。临时真实 uid/gid 65534 的产品演练和服务身份拒绝测试验证实际降权及文件属主。 |
+| `src/upgrade/execution.rs::local_ip_addresses`，本机接口地址枚举 | 通过 `getifaddrs` 读取内核提供的接口地址；仅在调用成功后遍历，检查地址族后转换指针，复制 IPv4/IPv6 值，最后恰好一次 `freeifaddrs`。 | std 没有接口枚举 API；不执行外部命令，不发网络请求，不改变网络设置。允许本机明确监听地址，仍拒绝远端、通配和多播探测目标。 |
 | `src/upgrade/execution.rs::group_id`，NSS 调用及初始化读取 | 同样固定 64 KiB、成功和输出指针检查；数字 GID 使用安全解析直接返回。 | 不读取或输出 NSS 内部字符串，安全错误不反射系统配置；普通 User/Group 与数据目录身份必须相符。 |
 | `src/upgrade/process.rs::duplicate_inherited_file`，描述符复制及所有权接管 | 先限制输入描述符范围，再使用 `F_DUPFD_CLOEXEC` 原子创建新描述符；仅在成功后构造唯一所有者。 | std 没有从显式继承的裸描述符安全复制并接管所有权的接口；原输入描述符不被关闭，失败不会构造无效 `File`。 |
 | `src/upgrade/process.rs::run_bounded_command`，`Command::pre_exec` | fork 后固定 FD 4 执行已验证文件，继承 root 身份和专用锁 FD 5；父进程保持文件及祖先句柄。闭包只有固定 libc 描述符和凭据调用，无分配、锁或异步运行时。 | 管道非阻塞与辅助组查询改用安全 rustix。固定执行 FD 与同 OFD 锁的继承只在子进程改变 CLOEXEC；服务 UID/GID 是独立辅助程序的显式数据参数。双管道字节/时间限制与 kill+wait 风险测试及临时权限/真实包清单校验。 |
 
-整个 Rust 包使用 `unsafe_code = "deny"`，仅允许表中四个必要函数的窄例外。DTO、状态机、快照和恢复模块没有独立的 unchecked 边界。
+整个 Rust 包使用 `unsafe_code = "deny"`，仅允许表中五个必要函数的窄例外。DTO、状态机、快照和恢复模块没有独立的 unchecked 边界。
 
 ## 规范适用与证据
 

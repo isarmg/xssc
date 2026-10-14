@@ -1604,3 +1604,53 @@ fn shared_directory_flock_preserves_inode_and_restores_all_business_contents() {
         .is_err()
     );
 }
+
+#[test]
+fn readiness_accepts_explicit_local_ipv4_and_ipv6() {
+    let local = ["192.168.1.20".parse().unwrap(), "fd00::20".parse().unwrap()];
+    for address in [
+        "192.168.1.20:18105",
+        "[fd00::20]:18105",
+        "[::ffff:192.168.1.20]:18105",
+    ] {
+        assert!(
+            readiness_address_allowed(address.parse().unwrap(), &local),
+            "{address}"
+        );
+    }
+    for address in ["127.0.0.1:18105", "[::1]:18105", "[::ffff:127.0.0.1]:18105"] {
+        assert!(
+            readiness_address_allowed(address.parse().unwrap(), &[]),
+            "{address}"
+        );
+    }
+    for address in [
+        "192.168.1.21:18105",
+        "[fd00::21]:18105",
+        "0.0.0.0:18105",
+        "[::]:18105",
+        "224.0.0.1:18105",
+        "[ff02::1]:18105",
+        "192.168.1.20:0",
+    ] {
+        assert!(
+            !readiness_address_allowed(address.parse().unwrap(), &local),
+            "{address}"
+        );
+    }
+}
+
+#[test]
+fn readiness_rejects_non_unicast_even_in_interface_inventory() {
+    for address in [
+        "0.0.0.0:18105",
+        "[::]:18105",
+        "224.0.0.1:18105",
+        "[ff02::1]:18105",
+        "[::ffff:0.0.0.0]:18105",
+        "[::ffff:224.0.0.1]:18105",
+    ] {
+        let address: SocketAddr = address.parse().unwrap();
+        assert!(!readiness_address_allowed(address, &[address.ip()]));
+    }
+}

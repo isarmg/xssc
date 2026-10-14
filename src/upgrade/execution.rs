@@ -385,3 +385,42 @@ pub(super) fn cleanup_completed(journal: &UpgradeJournal) -> anyhow::Result<()> 
     );
     cleanup_payload(journal)
 }
+
+/// Read assigned addresses without contacting another host or changing a socket.
+#[allow(unsafe_code)] // libc owns the getifaddrs list until freeifaddrs below.
+pub(super) fn local_ip_addresses() -> anyhow::Result<Vec<std::net::IpAddr>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut head = std::ptr::null_mut();
+    // SAFETY: head is a valid output pointer. A successful call owns one list.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot inspect local readiness addresses");
+    }
+    let mut addresses = Vec::new();
+    let mut current = head;
+    // SAFETY: every node/address belongs to the successful getifaddrs result.
+    // Check the family before casting; copy only value fields and free once.
+    unsafe {
+        while !current.is_null() {
+            let node = &*current;
+            if !node.ifa_addr.is_null() {
+                match i32::from((*node.ifa_addr).sa_family) {
+                    libc::AF_INET => {
+                        let address = &*node.ifa_addr.cast::<libc::sockaddr_in>();
+                        addresses.push(IpAddr::V4(Ipv4Addr::from(
+                            address.sin_addr.s_addr.to_ne_bytes(),
+                        )));
+                    }
+                    libc::AF_INET6 => {
+                        let address = &*node.ifa_addr.cast::<libc::sockaddr_in6>();
+                        addresses.push(IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            current = node.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    Ok(addresses)
+}
